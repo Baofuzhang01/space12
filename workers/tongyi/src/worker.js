@@ -856,7 +856,46 @@ function getReadingZoneGroups() {
   const groups = currentSchool && Array.isArray(currentSchool.reading_zone_groups)
     ? currentSchool.reading_zone_groups
     : [];
-  return groups.length ? groups : DEFAULT_READING_ZONE_GROUPS;
+  const normalized = normalizeReadingZoneGroups(groups);
+  return normalized.length ? normalized : DEFAULT_READING_ZONE_GROUPS;
+}
+
+function normalizeReadingZoneGroups(raw) {
+  if (!Array.isArray(raw) || raw.length === 0) return [];
+
+  const normalizedGroups = [];
+  const flatZones = [];
+
+  for (const item of raw) {
+    if (!item || typeof item !== "object") continue;
+
+    // 结构1: [{ floor, zones: [{id,name}] }]
+    if (Array.isArray(item.zones)) {
+      const floor = String(item.floor || "未分层").trim() || "未分层";
+      const zones = item.zones
+        .map((z) => {
+          if (!z || typeof z !== "object") return null;
+          const id = String(z.id || z.roomid || "").trim();
+          if (!id) return null;
+          const name = String(z.name || z.roomName || z.title || id).trim() || id;
+          return { id, name };
+        })
+        .filter(Boolean);
+
+      if (zones.length) normalizedGroups.push({ floor, zones });
+      continue;
+    }
+
+    // 结构2: [{ roomid, name, ... }] （extract_room_ids.py --json 输出）
+    const id = String(item.roomid || item.id || "").trim();
+    if (id) {
+      const name = String(item.name || item.roomName || id).trim() || id;
+      flatZones.push({ id, name });
+    }
+  }
+
+  if (flatZones.length) normalizedGroups.push({ floor: "未分层", zones: flatZones });
+  return normalizedGroups;
 }
 
 async function api(method, path, body = null) {
@@ -1415,7 +1454,11 @@ async function doEditSchool() {
     try {
       const parsed = JSON.parse(readingZonesRaw);
       if (!Array.isArray(parsed)) return toast("阅览区映射 JSON 必须是数组", "error");
-      readingZoneGroups = parsed;
+      const normalized = normalizeReadingZoneGroups(parsed);
+      if (!normalized.length) {
+        return toast("阅览区映射 JSON 结构无效：请使用 floor/zones 或 roomid 列表", "error");
+      }
+      readingZoneGroups = normalized;
     } catch (e) {
       return toast("阅览区映射 JSON 解析失败: " + (e.message || String(e)), "error");
     }

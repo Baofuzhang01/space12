@@ -149,6 +149,7 @@ test_*.py
 # 本地脚本（不上传）
 switch_remote.py
 auto_commit.sh
+extract_room_ids.py
 
 # Cloudflare Workers 本地缓存
 workers/**/.wrangler/
