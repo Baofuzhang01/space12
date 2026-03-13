@@ -110,6 +110,26 @@ jobs:
           TULINGCLOUD_PASSWORD: ${{ secrets.TULINGCLOUD_PASSWORD }}
           TULINGCLOUD_MODEL_ID: ${{ secrets.TULINGCLOUD_MODEL_ID }}
         run: |
-          python main.py --action
+          python main.py --action 2>&1 | tee reserve.log
+
+      - name: Extract key logs (manual)
+        if: ${{ always() }}
+        env:
+          USER_NAME: manual
+        run: |
+          user_name="${USER_NAME}"
+          {
+            echo "### 用户关键日志 - ${user_name}"
+            echo
+            echo "筛选规则：登录、token 获取、验证码、策略发射/结果、提交参数、保存失败、座位递增、dispatch/异常、结束状态"
+            echo
+            echo '```text'
+            if [[ -f reserve.log ]]; then
+              grep -E "Start first attempt|login successfully|\[strategic\]|\[burst\]|submit parameter|submit enc|Get token|Got token|token fetch failed|No submit_enc|captcha|Slider captcha token|Textclick captcha token|保存失败|seat-increment|dispatch|HTTP [0-9]{3}|exception|error|Current time|reserved successfully|success list" reserve.log | tail -n 260 || true
+            else
+              echo "reserve.log not found"
+            fi
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
 
