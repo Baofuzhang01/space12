@@ -63,7 +63,7 @@ jobs:
       - name: Extract key logs
         if: ${{ always() }}
         run: |
-          user_name='${{ matrix.user.remark || matrix.user.username || "user" }}'
+          user_name='${{ matrix.user.remark || matrix.user.username || 'user' }}'
           {
             echo "### 用户关键日志 - ${user_name}"
             echo
