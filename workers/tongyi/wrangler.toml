@@ -14,8 +14,8 @@ main = "src/worker.js"
 compatibility_date = "2024-01-01"
 
 [triggers]
-# 每分钟轮询, 通过 KV trigger_time 判断是否到点
-crons = ["* * * * *"]
+# 北京时间 05:53-22:56 的分钟窗口，Cloudflare cron 使用 UTC
+crons = ["53-56 21-23 * * *", "53-56 0-14 * * *"]
 
 [[kv_namespaces]]
 binding = "SEAT_KV"

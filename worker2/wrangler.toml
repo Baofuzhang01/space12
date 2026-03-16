@@ -4,11 +4,16 @@ main = "worker2.js"
 compatibility_date = "2024-01-01"
 
 [triggers]
-crons = ["* * * * *"]
+# 北京时间 05:54-22:57 的分钟窗口，Cloudflare cron 使用 UTC
+crons = ["54-57 21-23 * * *", "54-57 0-14 * * *"]
 
 [vars]
 FEISHU_WEBHOOK = "https://open.feishu.cn/open-apis/bot/v2/hook/7cae2f91-8518-4ba1-bf98-dec6054d936c"
 FEISHU_KEYWORD = "检测"
 TRIGGER_API = "https://tongyi.baofuzhang0402.workers.dev/api"
 API_KEY = "depot005q"
-TRIGGER_TIMEOUT_MINUTES = "30"
+# tongyi 所在账号与心跳 KV namespace，worker2 通过 Cloudflare KV REST API 跨账号读取
+HEARTBEAT_SOURCE_ACCOUNT_ID = "288006df1270dacb1b639eb6b60ad881"
+HEARTBEAT_SOURCE_NAMESPACE_ID = "855ed3d52d7b47c9bbf76681d69de5b5"
+# 运行时还需要设置 secret：
+# wrangler secret put HEARTBEAT_SOURCE_API_TOKEN

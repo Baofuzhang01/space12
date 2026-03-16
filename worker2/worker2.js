@@ -1,5 +1,5 @@
 // worker2.js
-// 独立兜底 Worker：通过 tongyi 自身的状态 API 检查心跳，不再依赖 Cloudflare 账号级 API
+// 独立兜底 Worker：通过 Cloudflare KV REST API 跨账号读取 tongyi 的心跳 KV，并用小时锁避免重复兜底
 
 function beijingNow() {
   return new Date(Date.now() + 8 * 3600 * 1000);
@@ -24,6 +24,106 @@ function jsonResp(data, status = 200) {
     status,
     headers: { "Content-Type": "application/json; charset=utf-8" },
   });
+}
+
+const HEARTBEAT_LAST_TS_KEY = "meta:heartbeat:last_ts";
+const HEARTBEAT_TIMEOUT_MS = 60 * 1000;
+const FALLBACK_HOUR_LOCK_PREFIX = "meta:fallback_hour_lock";
+const FALLBACK_HOUR_LOCK_TTL_SECONDS = 48 * 60 * 60;
+
+function beijingDateHour() {
+  const d = beijingNow();
+  const y = d.getUTCFullYear();
+  const m = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const day = String(d.getUTCDate()).padStart(2, "0");
+  const hour = String(d.getUTCHours()).padStart(2, "0");
+  return `${y}-${m}-${day}-${hour}`;
+}
+
+function getRemoteKvConfig(env) {
+  const accountId = String(env.HEARTBEAT_SOURCE_ACCOUNT_ID || "").trim();
+  const namespaceId = String(env.HEARTBEAT_SOURCE_NAMESPACE_ID || "").trim();
+  const apiToken = String(env.HEARTBEAT_SOURCE_API_TOKEN || "").trim();
+  if (!accountId || !namespaceId || !apiToken) {
+    throw new Error("heartbeat source KV config missing: HEARTBEAT_SOURCE_ACCOUNT_ID / HEARTBEAT_SOURCE_NAMESPACE_ID / HEARTBEAT_SOURCE_API_TOKEN");
+  }
+  return { accountId, namespaceId, apiToken };
+}
+
+function buildRemoteKvValueUrl(env, key, extraParams = {}) {
+  const { accountId, namespaceId } = getRemoteKvConfig(env);
+  const url = new URL(
+    `https://api.cloudflare.com/client/v4/accounts/${accountId}/storage/kv/namespaces/${namespaceId}/values/${encodeURIComponent(key)}`
+  );
+  for (const [name, value] of Object.entries(extraParams)) {
+    if (value === undefined || value === null || value === "") continue;
+    url.searchParams.set(name, String(value));
+  }
+  return url.toString();
+}
+
+function getRemoteKvHeaders(env) {
+  const { apiToken } = getRemoteKvConfig(env);
+  return {
+    Authorization: `Bearer ${apiToken}`,
+  };
+}
+
+async function getRemoteKvText(env, key) {
+  const response = await fetch(buildRemoteKvValueUrl(env, key), {
+    headers: getRemoteKvHeaders(env),
+  });
+
+  if (response.status === 404) return null;
+  if (!response.ok) {
+    throw new Error(`KV GET failed for ${key}: HTTP ${response.status} ${await response.text()}`);
+  }
+  return await response.text();
+}
+
+async function putRemoteKvText(env, key, value, options = {}) {
+  const response = await fetch(
+    buildRemoteKvValueUrl(env, key, {
+      expiration_ttl: options.expirationTtl,
+    }),
+    {
+      method: "PUT",
+      headers: getRemoteKvHeaders(env),
+      body: String(value),
+    }
+  );
+
+  if (!response.ok) {
+    throw new Error(`KV PUT failed for ${key}: HTTP ${response.status} ${await response.text()}`);
+  }
+}
+
+async function getHeartbeatTimestamp(env) {
+  const raw = await getRemoteKvText(env, HEARTBEAT_LAST_TS_KEY);
+  const ts = parseInt(String(raw || "").trim(), 10);
+  if (Number.isNaN(ts) || ts <= 0) return null;
+  return ts;
+}
+
+function buildFallbackHourLockKey(hourKey) {
+  return `${FALLBACK_HOUR_LOCK_PREFIX}:${hourKey}`;
+}
+
+async function getFallbackHourLock(env, hourKey) {
+  const raw = await getRemoteKvText(env, buildFallbackHourLockKey(hourKey));
+  return raw ? JSON.parse(raw) : null;
+}
+
+async function saveFallbackHourLock(env, hourKey, record) {
+  await putRemoteKvText(
+    env,
+    buildFallbackHourLockKey(hourKey),
+    JSON.stringify(record),
+    {
+      expirationTtl: FALLBACK_HOUR_LOCK_TTL_SECONDS,
+    },
+  );
+  return record;
 }
 
 function parseTimeToSeconds(text) {
@@ -77,17 +177,16 @@ async function fetchJson(url, init = {}) {
   return data;
 }
 
-async function getWorker1Status(env) {
-  return fetchJson(`${env.TRIGGER_API}/status`, {
-    headers: { "X-API-Key": env.API_KEY },
-  });
-}
-
 async function getSchools(env) {
   const data = await fetchJson(`${env.TRIGGER_API}/schools`, {
     headers: { "X-API-Key": env.API_KEY },
   });
   return data.schools || [];
+}
+
+async function getDueSchools(env) {
+  const schools = await getSchools(env);
+  return schools.filter(shouldTriggerSchoolNow);
 }
 
 async function triggerSchool(env, schoolId, options = {}) {
@@ -234,12 +333,11 @@ function formatFallbackMessages(title, lines, fallback) {
   return messages;
 }
 
-async function triggerDueSchools(env, options = {}) {
-  const schools = await getSchools(env);
-  const dueSchools = schools.filter(shouldTriggerSchoolNow);
+async function triggerDueSchools(env, options = {}, dueSchools = null) {
+  const schoolsToTrigger = Array.isArray(dueSchools) ? dueSchools : await getDueSchools(env);
   const results = [];
 
-  for (const school of dueSchools) {
+  for (const school of schoolsToTrigger) {
     try {
       const result = await triggerSchool(env, school.id, options);
       results.push({
@@ -264,87 +362,230 @@ async function triggerDueSchools(env, options = {}) {
 
   return {
     checkedAt: new Date().toISOString(),
-    dueCount: dueSchools.length,
+    dueCount: schoolsToTrigger.length,
     results,
   };
 }
 
 async function runWatchdog(env, options = {}) {
-  const thresholdMinutes = parseInt(env.TRIGGER_TIMEOUT_MINUTES || "30", 10);
-  const thresholdMs = Math.max(1, thresholdMinutes) * 60 * 1000;
+  const nowIso = new Date().toISOString();
+  const hourKey = beijingDateHour();
+  let heartbeatTs = null;
+  try {
+    heartbeatTs = await getHeartbeatTimestamp(env);
+  } catch (e) {
+    const notification = await sendFeishuText(
+      env,
+      [
+        "worker2 告警：无法读取 tongyi 心跳 KV，已跳过兜底。",
+        `错误: ${e.message || String(e)}`,
+        `北京时间: ${beijingHMS()}`,
+        `小时锁: ${hourKey}`,
+      ].join("\n")
+    );
+    return {
+      ok: false,
+      mode: "kv_unreachable",
+      manual: !!options.manual,
+      skipped: true,
+      reason: e.message || String(e),
+      now: nowIso,
+      beijing_time: beijingHMS(),
+      heartbeatKey: HEARTBEAT_LAST_TS_KEY,
+      fallbackHourKey: hourKey,
+      notification,
+    };
+  }
+  const diffMs = heartbeatTs === null ? null : Math.max(0, Date.now() - heartbeatTs);
+  const diffSeconds = diffMs === null ? null : Math.floor(diffMs / 1000);
+  const isStale = heartbeatTs === null || diffMs > HEARTBEAT_TIMEOUT_MS;
   const fallbackOptions = {
     triggerSource: "worker2",
     fallbackMode: options.manual ? "manual" : "scheduled",
   };
 
-  let status;
-  try {
-    status = await getWorker1Status(env);
-  } catch (e) {
-    const fallback = await triggerDueSchools(env, fallbackOptions);
-    const notifications = await sendFeishuAlerts(
-      env,
-      formatFallbackMessages(
-        "worker2 告警：无法读取 tongyi 状态接口，已执行兜底触发。",
-        [
-        `错误: ${e.message || String(e)}`,
-        `北京时间: ${beijingHMS()}`,
-        ],
-        fallback
-      )
-    );
-    return {
-      ok: false,
-      mode: "status_unreachable",
-      manual: !!options.manual,
-      reason: e.message || String(e),
-      fallback,
-      notifications,
-    };
-  }
-
-  const lastRunAt = status?.lastScheduledRun?.at;
-  const lastRunTs = lastRunAt ? Date.parse(lastRunAt) : NaN;
-  const ageMs = Number.isNaN(lastRunTs) ? null : Date.now() - lastRunTs;
-  const isStale = ageMs === null || ageMs > thresholdMs;
-
   if (!isStale) {
     return {
       ok: true,
       mode: "healthy",
-      now: new Date().toISOString(),
+      now: nowIso,
       beijing_time: beijingHMS(),
-      thresholdMinutes,
-      lastScheduledRun: status.lastScheduledRun,
-      ageMs,
+      heartbeatKey: HEARTBEAT_LAST_TS_KEY,
+      heartbeatTs,
+      diffMs,
+      diffSeconds,
+      thresholdMs: HEARTBEAT_TIMEOUT_MS,
+      fallbackHourKey: hourKey,
     };
   }
 
-  const fallback = await triggerDueSchools(env, fallbackOptions);
+  const dueSchools = await getDueSchools(env);
+  if (dueSchools.length === 0) {
+    return {
+      ok: false,
+      mode: "stale_no_due_school",
+      manual: !!options.manual,
+      skipped: true,
+      reason: "no_due_school_in_current_minute",
+      now: nowIso,
+      beijing_time: beijingHMS(),
+      heartbeatKey: HEARTBEAT_LAST_TS_KEY,
+      heartbeatTs,
+      diffMs,
+      diffSeconds,
+      thresholdMs: HEARTBEAT_TIMEOUT_MS,
+      fallbackHourKey: hourKey,
+    };
+  }
+
+  let existingLock = null;
+  try {
+    existingLock = await getFallbackHourLock(env, hourKey);
+  } catch (e) {
+    const notification = await sendFeishuText(
+      env,
+      [
+        "worker2 告警：无法读取兜底小时锁 KV，已跳过兜底。",
+        `错误: ${e.message || String(e)}`,
+        `北京时间: ${beijingHMS()}`,
+        `小时锁: ${hourKey}`,
+      ].join("\n")
+    );
+    return {
+      ok: false,
+      mode: "fallback_lock_unreachable",
+      manual: !!options.manual,
+      skipped: true,
+      reason: e.message || String(e),
+      now: nowIso,
+      beijing_time: beijingHMS(),
+      heartbeatKey: HEARTBEAT_LAST_TS_KEY,
+      heartbeatTs,
+      diffMs,
+      diffSeconds,
+      thresholdMs: HEARTBEAT_TIMEOUT_MS,
+      fallbackHourKey: hourKey,
+      notification,
+    };
+  }
+  if (existingLock) {
+    return {
+      ok: false,
+      mode: "stale_locked",
+      manual: !!options.manual,
+      skipped: true,
+      reason: "fallback_already_executed_this_hour",
+      now: nowIso,
+      beijing_time: beijingHMS(),
+      heartbeatKey: HEARTBEAT_LAST_TS_KEY,
+      heartbeatTs,
+      diffMs,
+      diffSeconds,
+      thresholdMs: HEARTBEAT_TIMEOUT_MS,
+      fallbackHourKey: hourKey,
+      fallbackLock: existingLock,
+    };
+  }
+
+  let fallbackLock = null;
+  try {
+    fallbackLock = await saveFallbackHourLock(env, hourKey, {
+      source: "worker2",
+      mode: options.manual ? "manual" : "scheduled",
+      hourKey,
+      at: nowIso,
+      beijing_time: beijingHMS(),
+      heartbeatTs,
+      diffMs,
+      diffSeconds,
+    });
+  } catch (e) {
+    const notification = await sendFeishuText(
+      env,
+      [
+        "worker2 告警：无法写入兜底小时锁 KV，已跳过兜底。",
+        `错误: ${e.message || String(e)}`,
+        `北京时间: ${beijingHMS()}`,
+        `小时锁: ${hourKey}`,
+      ].join("\n")
+    );
+    return {
+      ok: false,
+      mode: "fallback_lock_write_failed",
+      manual: !!options.manual,
+      skipped: true,
+      reason: e.message || String(e),
+      now: nowIso,
+      beijing_time: beijingHMS(),
+      heartbeatKey: HEARTBEAT_LAST_TS_KEY,
+      heartbeatTs,
+      diffMs,
+      diffSeconds,
+      thresholdMs: HEARTBEAT_TIMEOUT_MS,
+      fallbackHourKey: hourKey,
+      notification,
+    };
+  }
+
+  const heartbeatLabel = heartbeatTs === null ? "无记录" : String(heartbeatTs);
+  const preNotification = await sendFeishuText(
+    env,
+    [
+      "worker2 告警：检测到 tongyi 心跳超时，准备执行兜底任务。",
+      `最近心跳(ms): ${heartbeatLabel}`,
+      diffSeconds === null ? "" : `距离上次心跳: ${diffSeconds} 秒`,
+      `超时阈值: ${Math.floor(HEARTBEAT_TIMEOUT_MS / 1000)} 秒`,
+      `北京时间: ${beijingHMS()}`,
+      `小时锁: ${hourKey}`,
+    ].filter(Boolean).join("\n")
+  );
+
+  let fallback = {
+    checkedAt: new Date().toISOString(),
+    dueCount: 0,
+    results: [],
+  };
+  let fallbackError = "";
+  try {
+    fallback = await triggerDueSchools(env, fallbackOptions, dueSchools);
+  } catch (e) {
+    fallbackError = e.message || String(e);
+  }
+
   const notifications = await sendFeishuAlerts(
     env,
     formatFallbackMessages(
       "worker2 告警：tongyi 心跳超时，已执行兜底触发。",
       [
-      `最近心跳: ${lastRunAt || "无记录"}`,
-      `超时阈值: ${thresholdMinutes} 分钟`,
+      `最近心跳(ms): ${heartbeatLabel}`,
+      diffSeconds === null ? "" : `距离上次心跳: ${diffSeconds} 秒`,
+      `超时阈值: ${Math.floor(HEARTBEAT_TIMEOUT_MS / 1000)} 秒`,
       `北京时间: ${beijingHMS()}`,
-      ageMs === null ? "" : `距离上次心跳: ${Math.round(ageMs / 1000)} 秒`,
+      `小时锁: ${hourKey}`,
+      fallbackError ? `兜底执行错误: ${fallbackError}` : "",
       ],
       fallback
     )
   );
 
   return {
-    ok: false,
-    mode: "stale",
-    manual: !!options.manual,
-    thresholdMinutes,
-    lastScheduledRun: status.lastScheduledRun || null,
-    ageMs,
-    fallback,
-    notifications,
-  };
+      ok: false,
+      mode: "stale",
+      manual: !!options.manual,
+      now: nowIso,
+      beijing_time: beijingHMS(),
+      heartbeatKey: HEARTBEAT_LAST_TS_KEY,
+      heartbeatTs,
+      diffMs,
+      diffSeconds,
+      thresholdMs: HEARTBEAT_TIMEOUT_MS,
+      fallbackHourKey: hourKey,
+      fallbackLock,
+      preNotification,
+      fallback,
+      fallbackError,
+      notifications,
+    };
 }
 
 export default {
@@ -360,11 +601,21 @@ export default {
     }
 
     if (request.method === "GET" && url.pathname === "/health") {
+      let heartbeatTs = null;
+      let heartbeatError = "";
+      try {
+        heartbeatTs = await getHeartbeatTimestamp(env);
+      } catch (e) {
+        heartbeatError = e.message || String(e);
+      }
       return jsonResp({
         ok: true,
         worker: "worker2",
         now: new Date().toISOString(),
         beijing_time: beijingHMS(),
+        heartbeatKey: HEARTBEAT_LAST_TS_KEY,
+        heartbeatTs,
+        heartbeatError,
       });
     }
 

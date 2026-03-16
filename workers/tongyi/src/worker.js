@@ -2,7 +2,7 @@
 // 多学校抢座管理中枢 — Cloudflare Worker
 // ====================================================================
 // 功能:
-//   1. scheduled()  每分钟轮询所有学校，到点为活跃用户发 dispatch
+//   1. scheduled()  在预约窗口内轮询学校，并异步写入秒级心跳到 KV
 //   2. fetch()      REST API + 内嵌 Web 管理面板
 //
 // KV Schema (binding: SEAT_KV):
@@ -62,6 +62,15 @@ function beijingDayOfWeek() {
   return days[beijingNow().getUTCDay()];
 }
 
+function beijingDateHour() {
+  const d = beijingNow();
+  const y = d.getUTCFullYear();
+  const m = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const day = String(d.getUTCDate()).padStart(2, "0");
+  const hour = String(d.getUTCHours()).padStart(2, "0");
+  return `${y}-${m}-${day}-${hour}`;
+}
+
 function generateId() {
   return Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
 }
@@ -73,7 +82,8 @@ function jsonResp(data, status = 200) {
   });
 }
 
-const LAST_SCHEDULED_RUN_KEY = "meta:last_scheduled_run";
+const HEARTBEAT_LAST_TS_KEY = "meta:heartbeat:last_ts";
+const HEARTBEAT_TARGET_SECOND = 50;
 const FALLBACK_TRIGGER_PREFIX = "meta:fallback_trigger";
 const FALLBACK_TRIGGER_TTL_SECONDS = 14 * 24 * 60 * 60;
 
@@ -135,18 +145,55 @@ async function deleteUser(KV, schoolId, userId) {
   await saveSchoolUsers(KV, schoolId, userIds.filter(id => id !== userId));
 }
 
-async function saveScheduledHeartbeat(KV) {
-  await KV.put(LAST_SCHEDULED_RUN_KEY, JSON.stringify({
-    at: new Date().toISOString(),
-    beijing_date: beijingDate(),
-    beijing_time: beijingHHMM(),
-    day_of_week: beijingDayOfWeek(),
-  }));
+function minuteBucket(timestampMs) {
+  return Math.floor(timestampMs / 60000);
 }
 
-async function getScheduledHeartbeat(KV) {
-  const raw = await KV.get(LAST_SCHEDULED_RUN_KEY);
-  return raw ? JSON.parse(raw) : null;
+async function getHeartbeatTimestamp(KV) {
+  const raw = await KV.get(HEARTBEAT_LAST_TS_KEY);
+  const ts = parseInt(String(raw || "").trim(), 10);
+  if (Number.isNaN(ts) || ts <= 0) return null;
+  return ts;
+}
+
+async function sleep(ms) {
+  if (ms <= 0) return;
+  await new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function writeHeartbeatTimestamp(KV, timestampMs = Date.now()) {
+  const existingTs = await getHeartbeatTimestamp(KV);
+  if (
+    existingTs !== null &&
+    minuteBucket(existingTs) === minuteBucket(timestampMs)
+  ) {
+    return {
+      written: false,
+      reason: "already_written_this_minute",
+      timestamp: existingTs,
+      minuteBucket: minuteBucket(existingTs),
+    };
+  }
+
+  await KV.put(HEARTBEAT_LAST_TS_KEY, String(timestampMs));
+  return {
+    written: true,
+    timestamp: timestampMs,
+    minuteBucket: minuteBucket(timestampMs),
+  };
+}
+
+async function writeHeartbeatAtTargetSecond(KV, targetSecond = HEARTBEAT_TARGET_SECOND) {
+  const now = new Date();
+  const currentSecond = now.getUTCSeconds();
+  const currentMs = now.getUTCMilliseconds();
+
+  if (currentSecond < targetSecond) {
+    const delayMs = (targetSecond - currentSecond) * 1000 - currentMs;
+    await sleep(delayMs);
+  }
+
+  return writeHeartbeatTimestamp(KV, Date.now());
 }
 
 function buildFallbackTriggerKey(date, schoolId) {
@@ -662,8 +709,6 @@ async function handleScheduled(env) {
   const today = beijingDayOfWeek();
   const schoolIds = await getSchools(env.SEAT_KV);
 
-  await saveScheduledHeartbeat(env.SEAT_KV);
-
   for (const schoolId of schoolIds) {
     const school = await getSchool(env.SEAT_KV, schoolId);
     if (!school || school.trigger_time !== now) continue;
@@ -686,16 +731,22 @@ async function handleAPI(request, env, path) {
   // GET /api/status
   if (method === "GET" && path === "/api/status") {
     const schoolIds = await getSchools(KV);
-    const lastScheduledRun = await getScheduledHeartbeat(KV);
+    const lastHeartbeatTs = await getHeartbeatTimestamp(KV);
+    const heartbeatAgeMs = lastHeartbeatTs === null ? null : Math.max(0, Date.now() - lastHeartbeatTs);
     return jsonResp({
       ok: true,
       worker: "tongyi",
       now: new Date().toISOString(),
       beijing_date: beijingDate(),
       beijing_time: beijingHHMM(),
+      beijing_date_hour: beijingDateHour(),
       day_of_week: beijingDayOfWeek(),
       schoolCount: schoolIds.length,
-      lastScheduledRun,
+      heartbeat: {
+        key: HEARTBEAT_LAST_TS_KEY,
+        lastTs: lastHeartbeatTs,
+        ageMs: heartbeatAgeMs,
+      },
     });
   }
 
@@ -2106,6 +2157,7 @@ async function deleteUser(userId) {
 
 export default {
   async scheduled(event, env, ctx) {
+    ctx.waitUntil(writeHeartbeatAtTargetSecond(env.SEAT_KV));
     ctx.waitUntil(handleScheduled(env));
   },
   async fetch(request, env, ctx) {
