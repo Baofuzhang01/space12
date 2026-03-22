@@ -14,8 +14,8 @@ main = "src/worker.js"
 compatibility_date = "2024-01-01"
 
 [triggers]
-# 北京时间 05:53-21:56 的分钟窗口，Cloudflare cron 使用 UTC
-crons = ["53-56 21-23 * * *", "53-56 0-13 * * *"]
+# 北京时间常规分钟窗口 05:53-21:56，额外补充 21:23-21:26；Cloudflare cron 使用 UTC
+crons = ["53-56 21-23 * * *", "53-56 0-13 * * *", "23-26 13 * * *"]
 
 [[kv_namespaces]]
 binding = "SEAT_KV"

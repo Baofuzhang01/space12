@@ -4,8 +4,8 @@ main = "worker2.js"
 compatibility_date = "2024-01-01"
 
 [triggers]
-# 北京时间 05:54-21:57 的分钟窗口，Cloudflare cron 使用 UTC
-crons = ["54-57 21-23 * * *", "54-57 0-13 * * *"]
+# 北京时间常规分钟窗口 05:54-21:57，额外补充 21:24-21:27；Cloudflare cron 使用 UTC
+crons = ["54-57 21-23 * * *", "54-57 0-13 * * *", "24-27 13 * * *"]
 
 [vars]
 FEISHU_WEBHOOK = "https://open.feishu.cn/open-apis/bot/v2/hook/7cae2f91-8518-4ba1-bf98-dec6054d936c"

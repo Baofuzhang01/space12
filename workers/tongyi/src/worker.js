@@ -355,13 +355,13 @@ function defaultUser(id) {
     remark: "",
     status: "active",
     schedule: {
-      Monday: { enabled: false, slots: [{roomid:"",seatid:"",times:"",seatPageId:"",fidEnc:""},{roomid:"",seatid:"",times:"",seatPageId:"",fidEnc:""},{roomid:"",seatid:"",times:"",seatPageId:"",fidEnc:""}] },
-      Tuesday: { enabled: false, slots: [{roomid:"",seatid:"",times:"",seatPageId:"",fidEnc:""},{roomid:"",seatid:"",times:"",seatPageId:"",fidEnc:""},{roomid:"",seatid:"",times:"",seatPageId:"",fidEnc:""}] },
-      Wednesday: { enabled: false, slots: [{roomid:"",seatid:"",times:"",seatPageId:"",fidEnc:""},{roomid:"",seatid:"",times:"",seatPageId:"",fidEnc:""},{roomid:"",seatid:"",times:"",seatPageId:"",fidEnc:""}] },
-      Thursday: { enabled: false, slots: [{roomid:"",seatid:"",times:"",seatPageId:"",fidEnc:""},{roomid:"",seatid:"",times:"",seatPageId:"",fidEnc:""},{roomid:"",seatid:"",times:"",seatPageId:"",fidEnc:""}] },
-      Friday: { enabled: false, slots: [{roomid:"",seatid:"",times:"",seatPageId:"",fidEnc:""},{roomid:"",seatid:"",times:"",seatPageId:"",fidEnc:""},{roomid:"",seatid:"",times:"",seatPageId:"",fidEnc:""}] },
-      Saturday: { enabled: false, slots: [{roomid:"",seatid:"",times:"",seatPageId:"",fidEnc:""},{roomid:"",seatid:"",times:"",seatPageId:"",fidEnc:""},{roomid:"",seatid:"",times:"",seatPageId:"",fidEnc:""}] },
-      Sunday: { enabled: false, slots: [{roomid:"",seatid:"",times:"",seatPageId:"",fidEnc:""},{roomid:"",seatid:"",times:"",seatPageId:"",fidEnc:""},{roomid:"",seatid:"",times:"",seatPageId:"",fidEnc:""}] },
+      Monday: { enabled: false, slots: [{roomid:"",seatid:"",times:"",seatPageId:"",fidEnc:""},{roomid:"",seatid:"",times:"",seatPageId:"",fidEnc:""},{roomid:"",seatid:"",times:"",seatPageId:"",fidEnc:""},{roomid:"",seatid:"",times:"",seatPageId:"",fidEnc:""}] },
+      Tuesday: { enabled: false, slots: [{roomid:"",seatid:"",times:"",seatPageId:"",fidEnc:""},{roomid:"",seatid:"",times:"",seatPageId:"",fidEnc:""},{roomid:"",seatid:"",times:"",seatPageId:"",fidEnc:""},{roomid:"",seatid:"",times:"",seatPageId:"",fidEnc:""}] },
+      Wednesday: { enabled: false, slots: [{roomid:"",seatid:"",times:"",seatPageId:"",fidEnc:""},{roomid:"",seatid:"",times:"",seatPageId:"",fidEnc:""},{roomid:"",seatid:"",times:"",seatPageId:"",fidEnc:""},{roomid:"",seatid:"",times:"",seatPageId:"",fidEnc:""}] },
+      Thursday: { enabled: false, slots: [{roomid:"",seatid:"",times:"",seatPageId:"",fidEnc:""},{roomid:"",seatid:"",times:"",seatPageId:"",fidEnc:""},{roomid:"",seatid:"",times:"",seatPageId:"",fidEnc:""},{roomid:"",seatid:"",times:"",seatPageId:"",fidEnc:""}] },
+      Friday: { enabled: false, slots: [{roomid:"",seatid:"",times:"",seatPageId:"",fidEnc:""},{roomid:"",seatid:"",times:"",seatPageId:"",fidEnc:""},{roomid:"",seatid:"",times:"",seatPageId:"",fidEnc:""},{roomid:"",seatid:"",times:"",seatPageId:"",fidEnc:""}] },
+      Saturday: { enabled: false, slots: [{roomid:"",seatid:"",times:"",seatPageId:"",fidEnc:""},{roomid:"",seatid:"",times:"",seatPageId:"",fidEnc:""},{roomid:"",seatid:"",times:"",seatPageId:"",fidEnc:""},{roomid:"",seatid:"",times:"",seatPageId:"",fidEnc:""}] },
+      Sunday: { enabled: false, slots: [{roomid:"",seatid:"",times:"",seatPageId:"",fidEnc:""},{roomid:"",seatid:"",times:"",seatPageId:"",fidEnc:""},{roomid:"",seatid:"",times:"",seatPageId:"",fidEnc:""},{roomid:"",seatid:"",times:"",seatPageId:"",fidEnc:""}] },
     },
   };
 }
@@ -1347,7 +1347,7 @@ function createEmptyWeeklySchedule() {
   const days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
   const schedule = {};
   for (const d of days) {
-    schedule[d] = { enabled: false, slots: [_emptySlot(), _emptySlot(), _emptySlot()] };
+    schedule[d] = { enabled: false, slots: [_emptySlot(), _emptySlot(), _emptySlot(), _emptySlot()] };
   }
   return schedule;
 }
@@ -1393,10 +1393,9 @@ function parseScheduleJsonMapping(rawText) {
     const slots = (schedule[day].slots || []).filter(s => s && (s.roomid || s.times));
     if (slots.length === 0) {
       schedule[day].enabled = false;
-      schedule[day].slots = [_emptySlot(), _emptySlot(), _emptySlot()];
+      schedule[day].slots = [_emptySlot(), _emptySlot(), _emptySlot(), _emptySlot()];
       continue;
     }
-    // UI 仍显示 3 行，超出部分不会在表单中展示，但后端可保存全部。
     schedule[day].slots = slots;
   }
 
@@ -1439,9 +1438,10 @@ function fillScheduleFormFromSchedule(schedule) {
     const sch = schedule?.[d] || {};
     document.getElementById("sch_" + d + "_enabled").checked = !!sch.enabled;
     const slots = sch.slots || [{ roomid: sch.roomid, seatid: sch.seatid, times: sch.times, seatPageId: sch.seatPageId, fidEnc: sch.fidEnc }];
-    const visibleCount = Math.max(1, Math.min(3, slots.filter(Boolean).length || 1));
+    const activeCount = slots.filter(s => s && (s.roomid || s.seatid || s.times || s.seatPageId || s.fidEnc)).length;
+    const visibleCount = Math.max(1, Math.min(4, activeCount || 1));
     setVisibleSlotsForDay(d, visibleCount);
-    [0,1,2].forEach(i => {
+    [0,1,2,3].forEach(i => {
       const s = slots[i] || {};
       document.getElementById("sch_" + d + "_s" + i + "_roomid").value = s.roomid || "";
       document.getElementById("sch_" + d + "_s" + i + "_seatid").value = s.seatid || "";
@@ -1453,8 +1453,8 @@ function fillScheduleFormFromSchedule(schedule) {
 }
 
 function setVisibleSlotsForDay(day, count) {
-  const visibleCount = Math.max(1, Math.min(3, parseInt(count, 10) || 1));
-  [0,1,2].forEach(i => {
+  const visibleCount = Math.max(1, Math.min(4, parseInt(count, 10) || 1));
+  [0,1,2,3].forEach(i => {
     const row = document.getElementById("sch_" + day + "_row_" + i);
     if (!row) return;
     row.style.display = i < visibleCount ? "" : "none";
@@ -1463,7 +1463,7 @@ function setVisibleSlotsForDay(day, count) {
 
 function getVisibleSlotsForDay(day) {
   let count = 0;
-  [0,1,2].forEach(i => {
+  [0,1,2,3].forEach(i => {
     const row = document.getElementById("sch_" + day + "_row_" + i);
     if (row && row.style.display !== "none") count++;
   });
@@ -1938,7 +1938,7 @@ function renderUserModal() {
                   <input type="checkbox" id="sch_\${d}_enabled">
                   <label>\${dayNames[d]}</label>
                 </div>
-                \${[0,1,2].map(i => \`
+                \${[0,1,2,3].map(i => \`
                   <div class="slot-row" id="sch_\${d}_row_\${i}" style="\${i > 0 ? 'display:none;' : ''}">
                     <div class="slot-label">时段\${i+1}</div>
                     <div class="schedule-day-fields">
@@ -2154,7 +2154,7 @@ function showAddUser() {
   days.forEach(d => {
     document.getElementById("sch_" + d + "_enabled").checked = false;
     setVisibleSlotsForDay(d, 1);
-    [0,1,2].forEach(i => {
+    [0,1,2,3].forEach(i => {
       document.getElementById("sch_" + d + "_s" + i + "_roomid").value = "";
       document.getElementById("sch_" + d + "_s" + i + "_seatid").value = "";
       document.getElementById("sch_" + d + "_s" + i + "_times").value = "";

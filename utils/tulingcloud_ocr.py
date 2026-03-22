@@ -6,6 +6,7 @@
 import base64
 import json
 import logging
+import re
 from typing import Optional
 
 
@@ -79,24 +80,31 @@ class TulingCloudOCR:
                 
                 # 处理图灵云的一牡七哨的珛c中文字段名
                 if isinstance(response_data, dict):
-                    # 检查是否是陆序基的坐标格式
-                    # 我们要找序列顺序的条目
                     coordinates = []
                     recognized_chars = []
                     
-                    # 按顺序排序（"顺序1", "顺序2", "顺序3", "顺序4"等）
-                    for i in range(1, len(response_data) + 1):
-                        key = f"顺序{i}"
-                        if key in response_data:
-                            item = response_data[key]
-                            char = item.get("文\u5b57") or item.get("text", "")
-                            x = item.get("X\u5750\u6807\u503c") or item.get("x", 0)
-                            y = item.get("Y\u5750\u6807\u503c") or item.get("y", 0)
-                            
-                            if char:
-                                recognized_chars.append(char)
-                                coordinates.append({"x": int(x), "y": int(y)})
-                                logging.debug(f"Parsed '{char}' at ({x}, {y})")
+                    def _sort_key(key: str):
+                        match = re.search(r"(\d+)$", str(key))
+                        return int(match.group(1)) if match else 10**9
+
+                    for key in sorted(response_data.keys(), key=_sort_key):
+                        item = response_data.get(key)
+                        if not isinstance(item, dict):
+                            continue
+
+                        char = item.get("文\u5b57") or item.get("text", "")
+                        x = item.get("X\u5750\u6807\u503c") or item.get("x", 0)
+                        y = item.get("Y\u5750\u6807\u503c") or item.get("y", 0)
+                        
+                        if char:
+                            coordinates.append({
+                                "x": int(x),
+                                "y": int(y),
+                                "text": str(char),
+                                "source_key": str(key),
+                            })
+                            recognized_chars.append(str(char))
+                            logging.debug(f"Parsed '{char}' at ({x}, {y}) from {key}")
                     
                     if recognized_chars and coordinates:
                         recognized_text = "".join(recognized_chars)
@@ -104,7 +112,8 @@ class TulingCloudOCR:
                         logging.info(f"Coordinates: {coordinates}")
                         return {
                             "text": recognized_text,
-                            "coordinates": coordinates
+                            "coordinates": coordinates,
+                            "raw_result": result,
                         }
                     else:
                         logging.warning("TulingCloud returned empty result")

@@ -135,7 +135,52 @@ class reserve:
         self.enable_slider = enable_slider
         self.enable_textclick = enable_textclick
         self.reserve_next_day = reserve_next_day
+        self._captcha_context = {}
         requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+
+    def set_captcha_context(
+        self,
+        *,
+        roomid: str | None = None,
+        seat_num: str | None = None,
+        day: str | None = None,
+        seat_page_id: str | None = None,
+        fid_enc: str | None = None,
+    ):
+        self._captcha_context = {
+            "roomid": str(roomid or "").strip(),
+            "seat_num": str(seat_num or "").strip(),
+            "day": str(day or "").strip(),
+            "seat_page_id": str(seat_page_id or "").strip(),
+            "fid_enc": str(fid_enc or "").strip(),
+        }
+
+    def _build_captcha_referer(self):
+        ctx = self._captcha_context or {}
+        roomid = ctx.get("roomid", "")
+        seat_num = ctx.get("seat_num", "")
+        day = ctx.get("day", "")
+        seat_page_id = ctx.get("seat_page_id", "")
+        fid_enc = ctx.get("fid_enc", "")
+
+        params = [("id", roomid), ("seatNum", seat_num)]
+        if day:
+            params.append(("day", day))
+        if seat_page_id:
+            params.append(("seatId", seat_page_id))
+        if fid_enc:
+            params.append(("fidEnc", fid_enc))
+
+        query = "&".join(
+            f"{key}={value}"
+            for key, value in params
+            if value
+        )
+        referer = "https://office.chaoxing.com/front/third/apps/seat/code"
+        if query:
+            referer = f"{referer}?{query}"
+        logging.debug(f"Using captcha referer: {referer}")
+        return referer
 
     @staticmethod
     def _is_terminal_submit_failure(msg: str) -> bool:
@@ -207,6 +252,47 @@ class reserve:
 
     def _post(self, url, **kwargs):
         return self._request_with_retry("POST", url, **kwargs)
+
+    def probe_not_open_fast(self, url):
+        """轻量探测选座页是否仍处于“未开放”状态。
+
+        只发起一次不跟随重定向的 GET，请求体不做 HTML 解析；
+        优先根据响应头 Location，其次根据最终 response.url 判断是否包含
+        “当前区域未到开放预约时间”提示，以减少开放前的无效负载。
+
+        返回:
+            True: 明确仍未开放
+            False: 明确不是“未开放”页，可继续正式取 token
+            None: 请求异常或结果不明确，交给正式取 token 流程兜底
+        """
+        try:
+            response = self._get(
+                url=url,
+                verify=False,
+                allow_redirects=False,
+                attempts=1,
+                request_name="seat page fast not-open probe",
+            )
+        except requests.exceptions.RequestException as e:
+            logging.warning(f"Fast not-open probe failed for {url}: {e}")
+            return None
+
+        location = response.headers.get("Location", "")
+        if location and self._is_token_page_not_open(response_url=location):
+            return True
+
+        final_url = getattr(response, "url", "") or ""
+        if self._is_token_page_not_open(response_url=final_url):
+            return True
+
+        # 302 但没有命中 not-open 提示，通常说明页面已经进入正常流程或其他跳转页。
+        if response.is_redirect or response.is_permanent_redirect:
+            return False
+
+        if response.status_code == 200:
+            return False
+
+        return None
 
     # login and page token
     def _get_page_token(
@@ -485,13 +571,12 @@ class reserve:
         """选字验证码求解。"""
         logging.info("Start to resolve textclick captcha token")
         captcha_token, image_url, target_text = self.get_textclick_captcha_data()
-        if not captcha_token or not image_url:
+        if not captcha_token or not image_url or not target_text:
             logging.warning("Failed to get textclick captcha payload")
             return ""
         logging.info(f"Successfully get prepared captcha_token {captcha_token}")
-        logging.info(f"Target text: {target_text}")
+        logging.info(f"Target text raw: {target_text}")
         
-        # 使用颜色分割检测字位置
         positions = self._recognize_textclick_positions(image_url, target_text)
         if not positions:
             logging.warning("Failed to recognize text positions")
@@ -499,9 +584,54 @@ class reserve:
         
         logging.info(f"Successfully recognize positions: {positions}")
         
-        # 尝试控法提交，目前不能100%保证页序正确
-        # 所以放记了目前的应对数序验证，直接提交
         return self._submit_captcha("textclick", captcha_token, positions)
+
+    @staticmethod
+    def _parse_textclick_target_chars(target_text: str):
+        """尽量稳健地从题面里提取需要按顺序点击的文字。"""
+        raw = str(target_text or "").strip()
+        if not raw:
+            return []
+
+        quote_patterns = [
+            r'"([^"]+)"',
+            r"“([^”]+)”",
+            r"‘([^’]+)’",
+            r"「([^」]+)」",
+            r"『([^』]+)』",
+        ]
+        for pattern in quote_patterns:
+            matches = [m.strip() for m in re.findall(pattern, raw) if m and m.strip()]
+            if matches:
+                chars = []
+                for part in matches:
+                    chars.extend([c for c in part if c.strip()])
+                if chars:
+                    return chars
+
+        normalized = raw
+        for phrase in [
+            "请按顺序点击",
+            "请依次点击",
+            "请顺序点击",
+            "依次点击",
+            "顺序点击",
+            "点击",
+            "文字",
+            "汉字",
+            "字符",
+            "下列",
+            "以下",
+            "图中",
+            "图片中",
+            "请点击",
+            ":",
+            "：",
+        ]:
+            normalized = normalized.replace(phrase, " ")
+        normalized = re.sub(r"[\s,，.。;；、\-\[\]\(\)]+", " ", normalized)
+        chars = re.findall(r"[\u3400-\u4dbf\u4e00-\u9fff]", normalized)
+        return chars
 
     def _submit_captcha(self, captcha_type, captcha_token, click_array):
         """统一的验证码提交逻辑。
@@ -542,6 +672,8 @@ class reserve:
             logging.error(f"Failed to parse {captcha_type} captcha response: {e}")
             return ""
         logging.info(f"Successfully resolve the captcha token: {data}")
+        if not data.get("result"):
+            logging.warning(f"{captcha_type} captcha server rejected click array: {click_array}")
         try:
             validate_val = json.loads(data["extraData"])["validate"]
             return validate_val
@@ -554,7 +686,7 @@ class reserve:
         url = "https://captcha.chaoxing.com/captcha/get/verification/image"
         timestamp = int(time.time() * 1000)
         capture_key, token = generate_captcha_key(timestamp, captcha_type="textclick")
-        referer = f"https://office.chaoxing.com/front/third/apps/seat/code?id=3993&seatNum=0199"
+        referer = self._build_captcha_referer()
         params = {
             "callback": "jQuery33107685004390294206_1716461324846",
             "captchaId": "42sxgHoTPTKbt0uZxPJ7ssOvtXr3ZgZ1",
@@ -590,10 +722,13 @@ class reserve:
         captcha_token = data["token"]
         vo = data.get("imageVerificationVo", {})
         
-        # 获取图片 URL 和目标文字
         image_url = vo.get("originImage") or vo.get("shadeImage") or ""
-        # 目标文字格式："\"朝\" \"阳\" \"系\"" 或其他格式
         target_text = vo.get("context") or data.get("clickText") or ""
+        logging.info(
+            "Fetched textclick captcha payload: "
+            f"image_url={'yes' if image_url else 'no'}, "
+            f"target_text={target_text!r}"
+        )
         
         return captcha_token, image_url, target_text
 
@@ -669,13 +804,14 @@ class reserve:
                 logging.warning("TulingCloud failed to recognize text")
                 return None
             
-            # 处理返回结果（可能是字典或字符串）
             if isinstance(ocr_result, dict):
                 recognized_text = ocr_result.get("text", "")
                 coordinates = ocr_result.get("coordinates")
+                raw_ocr_result = ocr_result.get("raw_result")
             else:
                 recognized_text = ocr_result
                 coordinates = None
+                raw_ocr_result = None
             
             if not recognized_text:
                 logging.warning("TulingCloud returned empty text")
@@ -683,53 +819,51 @@ class reserve:
             
             logging.info(f"TulingCloud recognized text: {recognized_text}")
             logging.info(f"Target text to find: {target_text}")
+            if raw_ocr_result is not None:
+                logging.debug(f"TulingCloud raw_result: {raw_ocr_result}")
             
             if not coordinates:
                 logging.error(f"TulingCloud did not return coordinates")
                 return None
             
-            # 解析目标文字格式: " "" 业" """ "" 为单个字节）
-            # 例子: '" \u5730" "\u5927" "\u4efb"' -> ['\u5730', '\u5927', '\u4efb']
-            target_chars = []
-            i = 0
-            while i < len(target_text):
-                if target_text[i] == '"':
-                    # 找下一个双引号
-                    j = i + 1
-                    while j < len(target_text) and target_text[j] != '"':
-                        j += 1
-                    if j < len(target_text):
-                        target_chars.append(target_text[i+1:j])
-                        i = j + 1
-                    else:
-                        i += 1
-                else:
-                    i += 1
+            target_chars = self._parse_textclick_target_chars(target_text)
+            if not target_chars:
+                logging.warning(
+                    f"Could not parse target characters from textclick prompt: {target_text!r}"
+                )
+                return None
             
             logging.info(f"Parsed target characters: {target_chars}")
             
-            # 从图灵云的识别结果中找到目标字符的坐标
             result_positions = []
-            used_indices = set()  # 记录已使用的索引，避免重复匹配同一个字符
+            used_indices = set()
             
             for target_char in target_chars:
-                # 在识别的文字中找该字符（跳过已使用的索引）
                 found = False
-                for idx, recognized_char in enumerate(recognized_text):
-                    if recognized_char == target_char and idx < len(coordinates) and idx not in used_indices:
-                        result_positions.append(coordinates[idx])
+                for idx, coord in enumerate(coordinates):
+                    recognized_char = str(coord.get("text") or "")
+                    if (
+                        recognized_char == target_char
+                        and idx not in used_indices
+                        and coord.get("x") is not None
+                        and coord.get("y") is not None
+                    ):
+                        result_positions.append({
+                            "x": int(coord["x"]),
+                            "y": int(coord["y"]),
+                        })
                         used_indices.add(idx)
-                        logging.info(f"Found target '{target_char}' at position {idx}: {coordinates[idx]}")
+                        logging.info(
+                            f"Matched target '{target_char}' with OCR item #{idx}: {coord}"
+                        )
                         found = True
                         break
                 
                 if not found:
-                    # 如果有任何一个目标字符找不到，直接丢弃本次识别结果，返回 None
                     logging.warning(f"Target character '{target_char}' not found in recognized text '{recognized_text}'")
                     logging.warning(f"Discarding this captcha recognition, will retry with new captcha")
                     return None
             
-            # 确保找到了所有目标字符
             if len(result_positions) == len(target_chars):
                 logging.info(f"Final positions for target {target_chars}: {result_positions}")
                 return result_positions
@@ -747,7 +881,7 @@ class reserve:
         url = "https://captcha.chaoxing.com/captcha/get/verification/image"
         timestamp = int(time.time() * 1000)
         capture_key, token = generate_captcha_key(timestamp)
-        referer = f"https://office.chaoxing.com/front/third/apps/seat/code?id=3993&seatNum=0199"
+        referer = self._build_captcha_referer()
         params = {
             "callback": f"jQuery33107685004390294206_1716461324846",
             "captchaId": "42sxgHoTPTKbt0uZxPJ7ssOvtXr3ZgZ1",
@@ -923,6 +1057,13 @@ class reserve:
                     day=str(day),
                     seatPageId=seat_page_id or "",
                     fidEnc=fidEnc or "",
+                )
+                self.set_captcha_context(
+                    roomid=roomid,
+                    seat_num=seat,
+                    day=str(day),
+                    seat_page_id=seat_page_id,
+                    fid_enc=fidEnc,
                 )
                 # seatengine/select 页面在前端是通过 GET 打开的，这里也使用 GET，
                 # 否则可能拿到的是错误页或不包含 submit_enc 的内容。
