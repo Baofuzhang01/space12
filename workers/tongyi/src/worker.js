@@ -85,10 +85,15 @@ function generateId() {
   return Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
 }
 
-function jsonResp(data, status = 200) {
+function jsonResp(data, status = 200, extraHeaders = {}) {
   return new Response(JSON.stringify(data), {
     status,
-    headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
+    headers: {
+      "Content-Type": "application/json",
+      "Access-Control-Allow-Origin": "*",
+      "Cache-Control": "no-store, no-cache, must-revalidate",
+      ...extraHeaders,
+    },
   });
 }
 
@@ -96,10 +101,50 @@ function normalizeSecretText(value) {
   return typeof value === "string" ? value.trim() : "";
 }
 
+function parseTriggerTimeMinutes(value) {
+  const text = String(value || "").trim();
+  const match = text.match(/^(\d{1,2}):(\d{2})$/);
+  if (!match) return Number.MAX_SAFE_INTEGER;
+  const hour = parseInt(match[1], 10);
+  const minute = parseInt(match[2], 10);
+  if (Number.isNaN(hour) || Number.isNaN(minute)) return Number.MAX_SAFE_INTEGER;
+  if (hour < 0 || hour > 23 || minute < 0 || minute > 59) return Number.MAX_SAFE_INTEGER;
+  return hour * 60 + minute;
+}
+
+function getSortedSchoolsForDisplay(items) {
+  return (Array.isArray(items) ? items : [])
+    .filter(Boolean)
+    .slice()
+    .sort((a, b) => {
+      const timeDiff = parseTriggerTimeMinutes(a?.trigger_time) - parseTriggerTimeMinutes(b?.trigger_time);
+      if (timeDiff !== 0) return timeDiff;
+      return String(a?.id || "").localeCompare(String(b?.id || ""));
+    });
+}
+
+function normalizeConflictGroup(value) {
+  return normalizeSecretText(value).toLowerCase();
+}
+
+function getSchoolConflictGroup(school) {
+  const explicitGroup = normalizeConflictGroup(school?.conflict_group);
+  if (explicitGroup) {
+    return `group:${explicitGroup}`;
+  }
+
+  const fidEnc = normalizeConflictGroup(school?.fidEnc);
+  if (fidEnc) return `fid:${fidEnc}`;
+
+  return normalizeConflictGroup(school?.name);
+}
+
 const GITHUB_TOKEN_BINDINGS = {
   a: "GH_TOKEN_A",
   b: "GH_TOKEN_B",
   c: "GH_TOKEN_C",
+  d: "GH_TOKEN_D",
+  e: "GH_TOKEN_E",
 };
 
 function resolveGitHubToken(env, school = null) {
@@ -149,7 +194,7 @@ async function saveSchools(KV, schools) {
 
 async function getSchoolsSnapshot(KV) {
   const raw = await KV.get(SCHOOLS_SNAPSHOT_KEY);
-  if (raw) return JSON.parse(raw);
+  if (raw) return getSortedSchoolsForDisplay(JSON.parse(raw));
 
   const schoolIds = await getSchools(KV);
   if (schoolIds.length === 0) return [];
@@ -161,12 +206,13 @@ async function getSchoolsSnapshot(KV) {
     const userIds = await getSchoolUsers(KV, schoolId);
     schools.push({ ...school, userCount: userIds.length });
   }
-  await saveSchoolsSnapshot(KV, schools);
-  return schools;
+  const nextSchools = getSortedSchoolsForDisplay(schools);
+  await saveSchoolsSnapshot(KV, nextSchools);
+  return nextSchools;
 }
 
 async function saveSchoolsSnapshot(KV, schools) {
-  await KV.put(SCHOOLS_SNAPSHOT_KEY, JSON.stringify(schools));
+  await KV.put(SCHOOLS_SNAPSHOT_KEY, JSON.stringify(getSortedSchoolsForDisplay(schools)));
 }
 
 async function upsertSchoolInSnapshot(KV, school, userCount = null) {
@@ -356,6 +402,7 @@ function defaultSchool(id, name) {
   return {
     id,
     name,
+    conflict_group: "",
     trigger_time: "19:57",
     endtime: "20:00:40",
     fidEnc: "",
@@ -784,6 +831,10 @@ function collectScheduleSeatEntries(schedule) {
   return entries;
 }
 
+function buildSeatConflictKey(entry) {
+  return `${entry.day}|${entry.roomid}|${entry.seat}`;
+}
+
 function dayNameZh(day) {
   const map = {
     Monday: "周一",
@@ -797,27 +848,77 @@ function dayNameZh(day) {
   return map[day] || day;
 }
 
-async function findSeatConflicts(KV, schoolId, schedule, excludeUserId = "", schoolUsers = null) {
+async function getConflictScopeUsers(KV, schoolId, school = null) {
+  const targetSchool = school || await getSchool(KV, schoolId);
+  if (!targetSchool) return [];
+
+  const schools = await getSchoolsSnapshot(KV);
+  const targetGroup = getSchoolConflictGroup(targetSchool);
+  const relatedSchools = schools.filter(item => {
+    if (!item || !item.id) return false;
+    return getSchoolConflictGroup(item) === targetGroup;
+  });
+
+  const usersBySchool = await Promise.all(
+    relatedSchools.map(async item => {
+      const users = await getSchoolUsersSnapshot(KV, item.id);
+      return users.map(user => ({
+        ...user,
+        __schoolId: item.id,
+        __schoolName: item.name || item.id,
+      }));
+    })
+  );
+
+  return usersBySchool.flat();
+}
+
+async function findSeatConflicts(KV, schoolId, schedule, excludeIdentity = {}, schoolUsers = null) {
   const incomingEntries = collectScheduleSeatEntries(schedule);
   if (incomingEntries.length === 0) return [];
 
-  const sourceUsers = Array.isArray(schoolUsers) ? schoolUsers : await getSchoolUsersSnapshot(KV, schoolId);
+  const sourceUsers = Array.isArray(schoolUsers) ? schoolUsers : await getConflictScopeUsers(KV, schoolId);
   const existingByKey = new Map();
+  const conflicts = [];
+  const seenConflictKeys = new Set();
+  const excludeUserId = String(excludeIdentity?.userId || "").trim();
+  const excludePhone = String(excludeIdentity?.phone || "").trim();
+
+  const pushConflict = (incoming, existing) => {
+    const dedupeKey = `${buildSeatConflictKey(incoming)}|${existing.occupiedUserId || existing.occupiedBy || ""}`;
+    if (seenConflictKeys.has(dedupeKey)) return;
+    seenConflictKeys.add(dedupeKey);
+    conflicts.push({
+      day: incoming.day,
+      roomid: incoming.roomid,
+      seatid: incoming.seat,
+      times: incoming.times.label,
+      occupiedBy: existing.occupiedBy,
+      occupiedUserId: existing.occupiedUserId || "",
+      occupiedTimes: existing.occupiedTimes || "",
+      occupiedSchoolId: existing.occupiedSchoolId || schoolId,
+      occupiedSchoolName: existing.occupiedSchoolName || "",
+    });
+  };
 
   for (const existingUser of sourceUsers) {
     const uid = existingUser && existingUser.id;
     if (!uid) continue;
     if (excludeUserId && uid === excludeUserId) continue;
     if (!existingUser) continue;
+    const existingPhone = String(existingUser.phone || "").trim();
+    if (excludePhone && existingPhone && existingPhone === excludePhone) continue;
 
-    const owner = existingUser.username || "(无昵称)";
+    const owner = String(existingUser.username || "").trim() || "未填写昵称";
     const existingEntries = collectScheduleSeatEntries(existingUser.schedule || {});
     for (const entry of existingEntries) {
-      const key = `${entry.day}|${entry.roomid}|${entry.seat}`;
+      const key = buildSeatConflictKey(entry);
       const item = {
         ...entry,
         userId: uid,
         owner,
+        schoolId: existingUser.__schoolId || schoolId,
+        schoolName: existingUser.__schoolName || "",
       };
       const arr = existingByKey.get(key) || [];
       arr.push(item);
@@ -825,20 +926,26 @@ async function findSeatConflicts(KV, schoolId, schedule, excludeUserId = "", sch
     }
   }
 
-  const conflicts = [];
+  const incomingByKey = new Map();
   for (const incoming of incomingEntries) {
-    const key = `${incoming.day}|${incoming.roomid}|${incoming.seat}`;
+    const key = buildSeatConflictKey(incoming);
+    if (incomingByKey.has(key)) {
+      // 当前提交里自己重复填写了同一天/同房间/同座位时，不作为“冲突用户”报错。
+      // 这里保留首条记录继续参与和其他用户的冲突判断，避免出现
+      // “与昵称‘当前提交配置’冲突” 这种误导性提示。
+      continue;
+    }
+    incomingByKey.set(key, incoming);
+
     const occupied = existingByKey.get(key) || [];
     for (const existing of occupied) {
       // 只要同一天、同房间、同座位就算冲突，不判断时间段
-      conflicts.push({
-        day: incoming.day,
-        roomid: incoming.roomid,
-        seatid: incoming.seat,
-        times: incoming.times.label,
+      pushConflict(incoming, {
         occupiedBy: existing.owner,
         occupiedUserId: existing.userId,
         occupiedTimes: existing.times.label,
+        occupiedSchoolId: existing.schoolId,
+        occupiedSchoolName: existing.schoolName,
       });
       break;
     }
@@ -849,11 +956,11 @@ async function findSeatConflicts(KV, schoolId, schedule, excludeUserId = "", sch
 
 function buildSeatConflictError(conflicts) {
   if (!conflicts.length) return "";
-  const preview = conflicts.slice(0, 3).map(c => (
-    `${dayNameZh(c.day)} 房间${c.roomid} 座位${c.seatid} 时段${c.times} 已被用户“${c.occupiedBy}”占用`
-  ));
-  const suffix = conflicts.length > 3 ? `；另有 ${conflicts.length - 3} 条冲突` : "";
-  return `⚠️ 检测到座位冲突：${preview.join("；")}${suffix}`;
+  const first = conflicts[0];
+  const prefix = `${dayNameZh(first.day)} ${first.roomid}/${first.seatid}`;
+  const owner = first.occupiedBy || "未填写昵称";
+  const suffix = conflicts.length > 1 ? `，另有 ${conflicts.length - 1} 处重复` : "";
+  return `座位冲突：${prefix} 与昵称“${owner}”冲突${suffix}`;
 }
 
 // ─── Scheduled Handler ───
@@ -912,7 +1019,11 @@ async function handleAPI(request, env, path) {
   // GET /api/schools
   if (method === "GET" && path === "/api/schools") {
     const schools = await getSchoolsSnapshot(KV);
-    return jsonResp({ schools: schools.map(sanitizeSchoolForClient) });
+    return jsonResp(
+      { schools: getSortedSchoolsForDisplay(schools).map(sanitizeSchoolForClient) },
+      200,
+      { "Cache-Control": "private, max-age=5" }
+    );
   }
 
   // POST /api/school
@@ -921,6 +1032,9 @@ async function handleAPI(request, env, path) {
     const id = body.id || generateId();
     const name = body.name || `学校 ${id}`;
     const school = defaultSchool(id, name);
+    if (body.conflict_group !== undefined) {
+      school.conflict_group = normalizeSecretText(body.conflict_group);
+    }
     if (body.repo) school.repo = body.repo;
     if (body.github_token_key !== undefined) {
       school.github_token_key = normalizeSecretText(body.github_token_key).toLowerCase();
@@ -969,6 +1083,9 @@ async function handleAPI(request, env, path) {
     if (body.github_token_key !== undefined) {
       body.github_token_key = normalizeSecretText(body.github_token_key).toLowerCase();
     }
+    if (body.conflict_group !== undefined) {
+      body.conflict_group = normalizeSecretText(body.conflict_group);
+    }
     Object.assign(school, body, { id: school.id });
     await saveSchool(KV, school);
     return jsonResp({ ok: true, school: sanitizeSchoolForClient(school) });
@@ -986,7 +1103,11 @@ async function handleAPI(request, env, path) {
     const schoolId = usersMatch[1];
     const schoolUsers = await getSchoolUsersSnapshot(KV, schoolId);
     const users = schoolUsers.map(user => ({ ...user, password: user.password ? "******" : "" }));
-    return jsonResp({ users });
+    return jsonResp(
+      { users },
+      200,
+      { "Cache-Control": "private, max-age=3" }
+    );
   }
 
   // POST /api/school/:id/user
@@ -995,7 +1116,9 @@ async function handleAPI(request, env, path) {
     const schoolId = userCreateMatch[1];
     const body = await request.json();
     const id = body.id || generateId();
-    const schoolUsers = await getSchoolUsersSnapshot(KV, schoolId);
+    const school = await getSchool(KV, schoolId);
+    if (!school) return jsonResp({ error: "School not found" }, 404);
+    const schoolUsers = await getConflictScopeUsers(KV, schoolId, school);
     const user = defaultUser(id);
     user.phone = body.phone || "";
     user.username = body.username || "";
@@ -1004,14 +1127,18 @@ async function handleAPI(request, env, path) {
     if (body.status === "active" || body.status === "paused") user.status = body.status;
     if (body.schedule) user.schedule = body.schedule;
 
-    if (user.status === "active") {
-      const conflicts = await findSeatConflicts(KV, schoolId, user.schedule || {}, "", schoolUsers);
-      if (conflicts.length > 0) {
-        return jsonResp({
-          error: buildSeatConflictError(conflicts),
-          conflicts,
-        }, 409);
-      }
+    const conflicts = await findSeatConflicts(
+      KV,
+      schoolId,
+      user.schedule || {},
+      { userId: id, phone: user.phone },
+      schoolUsers,
+    );
+    if (conflicts.length > 0) {
+      return jsonResp({
+        error: buildSeatConflictError(conflicts),
+        conflicts,
+      }, 409);
     }
 
     await saveUser(KV, schoolId, user);
@@ -1035,21 +1162,26 @@ async function handleAPI(request, env, path) {
   // PUT /api/school/:id/user/:userId
   if (method === "PUT" && userMatch) {
     const [_, schoolId, userId] = userMatch;
+    const school = await getSchool(KV, schoolId);
+    if (!school) return jsonResp({ error: "School not found" }, 404);
     const user = await getUser(KV, schoolId, userId);
     if (!user) return jsonResp({ error: "User not found" }, 404);
     const body = await request.json();
-    const schoolUsers = await getSchoolUsersSnapshot(KV, schoolId);
+    const schoolUsers = await getConflictScopeUsers(KV, schoolId, school);
 
-    const nextStatus = body.status !== undefined ? body.status : user.status;
     const nextSchedule = body.schedule ? body.schedule : (user.schedule || {});
-    if (nextStatus === "active") {
-      const conflicts = await findSeatConflicts(KV, schoolId, nextSchedule, userId, schoolUsers);
-      if (conflicts.length > 0) {
-        return jsonResp({
-          error: buildSeatConflictError(conflicts),
-          conflicts,
-        }, 409);
-      }
+    const conflicts = await findSeatConflicts(
+      KV,
+      schoolId,
+      nextSchedule,
+      { userId, phone: body.phone !== undefined ? body.phone : user.phone },
+      schoolUsers,
+    );
+    if (conflicts.length > 0) {
+      return jsonResp({
+        error: buildSeatConflictError(conflicts),
+        conflicts,
+      }, 409);
     }
 
     if (body.phone !== undefined) user.phone = body.phone;
@@ -1075,8 +1207,26 @@ async function handleAPI(request, env, path) {
   const pauseMatch = path.match(/^\/api\/school\/([^/]+)\/user\/([^/]+)\/(pause|resume)$/);
   if (method === "POST" && pauseMatch) {
     const [_, schoolId, userId, action] = pauseMatch;
+    const school = await getSchool(KV, schoolId);
+    if (!school) return jsonResp({ error: "School not found" }, 404);
     const user = await getUser(KV, schoolId, userId);
     if (!user) return jsonResp({ error: "User not found" }, 404);
+    if (action === "resume") {
+      const schoolUsers = await getConflictScopeUsers(KV, schoolId, school);
+      const conflicts = await findSeatConflicts(
+        KV,
+        schoolId,
+        user.schedule || {},
+        { userId, phone: user.phone },
+        schoolUsers,
+      );
+      if (conflicts.length > 0) {
+        return jsonResp({
+          error: buildSeatConflictError(conflicts),
+          conflicts,
+        }, 409);
+      }
+    }
     user.status = action === "pause" ? "paused" : "active";
     await saveUser(KV, schoolId, user);
     return jsonResp({ ok: true, status: user.status });
@@ -1270,7 +1420,10 @@ async function handleFetch(request, env) {
 
   // 管理面板
   return new Response(ADMIN_HTML, {
-    headers: { "Content-Type": "text/html; charset=utf-8" },
+    headers: {
+      "Content-Type": "text/html; charset=utf-8",
+      "Cache-Control": "no-store, no-cache, must-revalidate",
+    },
   });
 }
 
@@ -1782,6 +1935,43 @@ async function refreshSchoolActiveTodayCounts(force = false) {
   if (currentView === "schools") render();
 }
 
+function parseTriggerTimeMinutes(value) {
+  const text = String(value || "").trim();
+  const match = text.match(/^(\d{1,2}):(\d{2})$/);
+  if (!match) return Number.MAX_SAFE_INTEGER;
+  const hour = parseInt(match[1], 10);
+  const minute = parseInt(match[2], 10);
+  if (Number.isNaN(hour) || Number.isNaN(minute)) return Number.MAX_SAFE_INTEGER;
+  if (hour < 0 || hour > 23 || minute < 0 || minute > 59) return Number.MAX_SAFE_INTEGER;
+  return hour * 60 + minute;
+}
+
+function getSortedSchoolsForDisplay(items) {
+  return (Array.isArray(items) ? items : [])
+    .filter(Boolean)
+    .slice()
+    .sort((a, b) => {
+      const timeDiff = parseTriggerTimeMinutes(a?.trigger_time) - parseTriggerTimeMinutes(b?.trigger_time);
+      if (timeDiff !== 0) return timeDiff;
+      return String(a?.id || "").localeCompare(String(b?.id || ""));
+    });
+}
+
+function upsertSchoolInOrderedList(items, school, options = {}) {
+  const list = (Array.isArray(items) ? items : []).filter(Boolean).slice();
+  const existingIndex = list.findIndex(item => item && item.id === school?.id);
+  const previous = existingIndex >= 0 ? list[existingIndex] : null;
+  const shouldResort = options.forceResort || !previous || previous.trigger_time !== school?.trigger_time;
+
+  if (existingIndex >= 0) {
+    list[existingIndex] = school;
+  } else {
+    list.push(school);
+  }
+
+  return shouldResort ? getSortedSchoolsForDisplay(list) : list;
+}
+
 function renderSchools() {
   const now = new Date().toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" });
   return \`
@@ -1796,7 +1986,7 @@ function renderSchools() {
           <button class="btn btn-primary" onclick="showAddSchool()">+ 添加学校</button>
         </div>
         <div class="school-grid">
-          \${schools.length ? schools.filter(Boolean).map(s => \`
+          \${schools.length ? schools.map(s => \`
             <div class="school-card" onclick="openSchool('\${s.id}')">
               <h3>\${s.name}</h3>
               <div class="meta">ID: \${s.id} | 仓库: \${s.repo}</div>
@@ -1838,12 +2028,18 @@ function renderAddSchoolModal() {
             <input type="text" id="new_school_repo" placeholder="BAOfuZhan/hcd">
           </div>
           <div class="form-group">
+            <label>冲突分组</label>
+            <input type="text" id="new_school_conflict_group" placeholder="可留空；留空时优先按学校 fidEnc 自动归并">
+          </div>
+          <div class="form-group">
             <label>GitHub 密匙槽位</label>
             <select id="new_school_github_token_key">
               <option value="">默认 GH_TOKEN</option>
               <option value="a">A -> GH_TOKEN_A</option>
               <option value="b">B -> GH_TOKEN_B</option>
               <option value="c">C -> GH_TOKEN_C</option>
+              <option value="d">D -> GH_TOKEN_D</option>
+              <option value="e">E -> GH_TOKEN_E</option>
             </select>
           </div>
           <div class="form-row">
@@ -1897,6 +2093,7 @@ function renderSchoolDetail() {
           <div><strong>今日活跃用户:</strong> \${formatActiveTodayMeta(s.id)}</div>
           <div><strong>GitHub 密匙槽位:</strong> \${s.github_token_key ? s.github_token_key.toUpperCase() : "默认 GH_TOKEN"}</div>
           <div><strong>学校 fidEnc:</strong> \${s.fidEnc || "-"}</div>
+          <div><strong>冲突分组:</strong> \${s.conflict_group || (s.fidEnc ? "自动按 fidEnc" : (s.name || "-"))}</div>
         </div>
       </div>
       <div class="card">
@@ -2019,7 +2216,13 @@ function renderEditSchoolModal() {
               <option value="a" \${s.github_token_key==="a" ? "selected" : ""}>A -> GH_TOKEN_A</option>
               <option value="b" \${s.github_token_key==="b" ? "selected" : ""}>B -> GH_TOKEN_B</option>
               <option value="c" \${s.github_token_key==="c" ? "selected" : ""}>C -> GH_TOKEN_C</option>
+              <option value="d" \${s.github_token_key==="d" ? "selected" : ""}>D -> GH_TOKEN_D</option>
+              <option value="e" \${s.github_token_key==="e" ? "selected" : ""}>E -> GH_TOKEN_E</option>
             </select>
+          </div>
+          <div class="form-group">
+            <label>冲突分组</label>
+            <input type="text" id="edit_school_conflict_group" value="\${s.conflict_group || ''}" placeholder="可留空；留空时优先按学校 fidEnc 自动归并">
           </div>
           <div class="form-row">
             <div class="form-group">
@@ -2218,7 +2421,7 @@ async function doLogin() {
     return;
   }
   localStorage.setItem("api_key", key);
-  schools = res.schools || [];
+  schools = getSortedSchoolsForDisplay(res.schools || []);
   currentView = "schools";
   render();
   refreshSchoolActiveTodayCounts(true);
@@ -2226,7 +2429,7 @@ async function doLogin() {
 
 async function loadSchools() {
   const res = await api("GET", "/api/schools");
-  schools = res.schools || [];
+  schools = getSortedSchoolsForDisplay(res.schools || []);
   render();
   refreshSchoolActiveTodayCounts();
 }
@@ -2243,6 +2446,7 @@ async function doAddSchool() {
   const id = document.getElementById("new_school_id").value.trim();
   const name = document.getElementById("new_school_name").value.trim();
   const repo = document.getElementById("new_school_repo").value.trim();
+  const conflict_group = document.getElementById("new_school_conflict_group").value.trim();
   const github_token_key = document.getElementById("new_school_github_token_key").value.trim().toLowerCase();
   const trigger_time = document.getElementById("new_school_trigger").value.trim();
   const endtime = document.getElementById("new_school_endtime").value.trim();
@@ -2252,6 +2456,7 @@ async function doAddSchool() {
     id,
     name,
     repo,
+    conflict_group,
     github_token_key,
     trigger_time,
     endtime,
@@ -2270,7 +2475,13 @@ async function doAddSchool() {
     }
     toast(msg);
     closeModal("addSchoolModal");
-    loadSchools();
+    if (res.school) {
+      schools = upsertSchoolInOrderedList(schools, res.school, { forceResort: true });
+      render();
+      refreshSchoolActiveTodayCounts(true);
+    } else {
+      loadSchools();
+    }
   } else {
     toast(res.error || "添加失败", "error");
   }
@@ -2336,6 +2547,7 @@ async function doEditSchool() {
   const body = {
     name: document.getElementById("edit_school_name").value.trim(),
     repo: document.getElementById("edit_school_repo").value.trim(),
+    conflict_group: document.getElementById("edit_school_conflict_group").value.trim(),
     github_token_key: githubTokenKey,
     trigger_time: document.getElementById("edit_school_trigger").value.trim(),
     endtime: document.getElementById("edit_school_endtime").value.trim(),
@@ -2363,6 +2575,7 @@ async function doEditSchool() {
   if (res.ok) {
     toast("配置已保存");
     currentSchool = res.school;
+    schools = upsertSchoolInOrderedList(schools, res.school);
     closeModal("editSchoolModal");
     render();
   } else {

@@ -9,6 +9,8 @@
 #    wrangler secret put GH_TOKEN_A    # GitHub PAT A (repo scope)
 #    wrangler secret put GH_TOKEN_B    # GitHub PAT B (repo scope)
 #    wrangler secret put GH_TOKEN_C    # GitHub PAT C (repo scope)
+#    wrangler secret put GH_TOKEN_D    # GitHub PAT D (repo scope)
+#    wrangler secret put GH_TOKEN_E    # GitHub PAT E (repo scope)
 #    wrangler secret put API_KEY        # 管理面板登录密钥
 
 name = "tongyi"
