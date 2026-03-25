@@ -105,6 +105,7 @@ MAX_ATTEMPT = 1
 SLEEPTIME = 0.05  # 每次抢座的间隔（减少到0.05秒以加快速度）
 WARM_CONNECTION_LEAD_MS = 2200  # 连接预热提前量（毫秒）
 FIRST_TOKEN_DATE_MODE = "today"  # 首次取 token 的日期：today 或 submit_date
+SEAT_API_MODE = "seat"  # 选座接口模式：auto / seatengine / seat
 FAST_PROBE_START_OFFSET_MS = 21  # 目标时间后多少毫秒开始轻探测
 FAST_PROBE_INTERVAL_MS = 2  # 轻探测轮询间隔（毫秒）
 FAST_PROBE_DEADLINE_MS = 1100  # 目标时间后多久强制结束轻探测并正式取 token
@@ -183,6 +184,10 @@ def _load_runtime_config(config_path, dispatch_mode, action):
             "reserve": reserve_list,
             "strategy": payload.get("strategy", {}),
             "endtime": payload.get("endtime", ENDTIME),
+            "seat_api_mode": payload.get("seat_api_mode", SEAT_API_MODE),
+            "reserve_next_day": payload.get("reserve_next_day", RESERVE_NEXT_DAY),
+            "enable_slider": payload.get("enable_slider", ENABLE_SLIDER),
+            "enable_textclick": payload.get("enable_textclick", ENABLE_TEXTCLICK),
             "relogin_every_loop": False,
         }
 
@@ -193,6 +198,9 @@ def _load_runtime_config(config_path, dispatch_mode, action):
 def _apply_strategy_config(config):
     global ENDTIME
     global RELOGIN_EVERY_LOOP
+    global RESERVE_NEXT_DAY
+    global ENABLE_SLIDER
+    global ENABLE_TEXTCLICK
     global STRATEGY_LOGIN_LEAD_SECONDS
     global STRATEGY_SLIDER_LEAD_SECONDS
     global STRATEGIC_MODE
@@ -205,9 +213,18 @@ def _apply_strategy_config(config):
     global TOKEN_FETCH_DELAY_MS
     global WARM_CONNECTION_LEAD_MS
     global FIRST_TOKEN_DATE_MODE
+    global SEAT_API_MODE
 
     strategy_cfg = config.get("strategy", {})
     ENDTIME = config.get("endtime", ENDTIME)
+    RESERVE_NEXT_DAY = bool(config.get("reserve_next_day", RESERVE_NEXT_DAY))
+    ENABLE_SLIDER = bool(config.get("enable_slider", ENABLE_SLIDER))
+    ENABLE_TEXTCLICK = bool(config.get("enable_textclick", ENABLE_TEXTCLICK))
+    seat_api_mode = str(config.get("seat_api_mode", SEAT_API_MODE)).strip().lower()
+    SEAT_API_MODE = (
+        seat_api_mode if seat_api_mode in {"auto", "seatengine", "seat"} else "auto"
+    )
+    os.environ["CX_SEAT_API_MODE"] = SEAT_API_MODE
     STRATEGY_LOGIN_LEAD_SECONDS = int(strategy_cfg.get("login_lead_seconds", 20))
     STRATEGY_SLIDER_LEAD_SECONDS = int(strategy_cfg.get("slider_lead_seconds", 14))
     STRATEGIC_MODE = strategy_cfg.get("mode", "B")

@@ -141,17 +141,31 @@ class reserve:
         self.login_page = (
             "https://passport2.chaoxing.com/mlogin?loginType=1&newversion=true&fid="
         )
-        # 使用 seatengine 选座页面来获取 submit_enc，与前端行为保持一致
-        # 使用命名占位符，包含 roomId/day/seatPageId/fidEnc 四个参数
-        # 结构与浏览器中实际 URL 对齐：
-        # /front/third/apps/seatengine/select?id=864&day=YYYY-MM-DD&backLevel=2&seatId=602&fidEnc=...
-        self.url = (
-            "https://office.chaoxing.com/front/third/apps/seat/select?"
-            "id={roomId}&day={day}&backLevel=2&seatId={seatPageId}&fidEnc={fidEnc}"
-        )
-        # 使用新版 seatengine 提交接口，与前端保持一致
-        self.submit_url = "https://office.chaoxing.com/data/apps/seat/submit"
-        self.seat_url = "https://office.chaoxing.com/data/apps/seat/getusedtimes"
+        self.api_urls = {
+            "seatengine": {
+                "select": (
+                    "https://office.chaoxing.com/front/third/apps/seatengine/select?"
+                    "id={roomId}&day={day}&backLevel=2&seatId={seatPageId}&fidEnc={fidEnc}"
+                ),
+                "submit": "https://office.chaoxing.com/data/apps/seatengine/submit",
+                "seat": "https://office.chaoxing.com/data/apps/seatengine/getusedtimes",
+                "code": "https://office.chaoxing.com/front/third/apps/seatengine/code",
+            },
+            "seat": {
+                "select": (
+                    "https://office.chaoxing.com/front/third/apps/seat/select?"
+                    "id={roomId}&day={day}&backLevel=2&seatId={seatPageId}&fidEnc={fidEnc}"
+                ),
+                "submit": "https://office.chaoxing.com/data/apps/seat/submit",
+                "seat": "https://office.chaoxing.com/data/apps/seat/getusedtimes",
+                "code": "https://office.chaoxing.com/front/third/apps/seat/code",
+            },
+        }
+        self.api_family = "seatengine"
+        self.url = ""
+        self.submit_url = ""
+        self.seat_url = ""
+        self.code_url = ""
         self.login_url = "https://passport2.chaoxing.com/fanyalogin"
         self.token = ""
         self.success_times = 0
@@ -208,7 +222,95 @@ class reserve:
         self._captcha_context = {}
         self._connection_trace_context = None
         self._warm_request_trace = {}
+        preferred_family = str(os.getenv("CX_SEAT_API_MODE", "seat")).strip().lower()
+        if preferred_family == "auto":
+            preferred_family = "seatengine"
+        self._set_api_family(preferred_family if preferred_family in self.api_urls else "seatengine")
         requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+
+    def _set_api_family(self, family: str):
+        family = str(family or "").strip().lower()
+        if family not in self.api_urls:
+            family = "seatengine"
+        urls = self.api_urls[family]
+        self.api_family = family
+        self.url = urls["select"]
+        self.submit_url = urls["submit"]
+        self.seat_url = urls["seat"]
+        self.code_url = urls["code"]
+
+    def _alternate_api_family(self, family: str | None = None) -> str:
+        current = str(family or self.api_family or "seatengine").strip().lower()
+        return "seat" if current == "seatengine" else "seatengine"
+
+    def _build_select_url_for_family(
+        self,
+        family: str,
+        roomid: str,
+        day: str,
+        seat_page_id: str | None,
+        fid_enc: str | None,
+    ) -> str:
+        return self.api_urls[family]["select"].format(
+            roomId=roomid,
+            day=str(day),
+            seatPageId=seat_page_id or "",
+            fidEnc=fid_enc or "",
+        )
+
+    def _get_select_url_candidates(self, url: str) -> list[tuple[str, str]]:
+        urls = []
+        current_family = self.api_family
+        raw = str(url or "")
+        if raw:
+            detected = current_family
+            if "/seatengine/" in raw:
+                detected = "seatengine"
+            elif "/apps/seat/" in raw or "/data/apps/seat/" in raw:
+                detected = "seat"
+            urls.append((detected, raw))
+
+        for family in [self.api_family, self._alternate_api_family(self.api_family)]:
+            candidate = self.api_urls[family]["select"]
+            if not any(existing_url == candidate for _, existing_url in urls):
+                urls.append((family, candidate))
+        return urls
+
+    def _submit_with_fallback(self, parm: dict, *, request_name: str):
+        families = [self.api_family, self._alternate_api_family(self.api_family)]
+        tried = set()
+
+        for family in families:
+            submit_url = self.api_urls[family]["submit"]
+            if submit_url in tried:
+                continue
+            tried.add(submit_url)
+            try:
+                response = self._post(
+                    url=submit_url,
+                    data=parm,
+                    verify=False,
+                    request_name=request_name,
+                )
+            except requests.exceptions.RequestException as e:
+                logging.warning(f"Seat submit request failed via {family}: {e}")
+                continue
+
+            html = response.content.decode("utf-8")
+            try:
+                data = json.loads(html)
+            except ValueError as e:
+                logging.warning(
+                    f"Failed to parse seat submit response via {family}: {e}; body={html[:200]}"
+                )
+                continue
+
+            if family != self.api_family:
+                logging.info(f"Seat submit fallback switched API family to {family}")
+                self._set_api_family(family)
+            return data
+
+        return None
 
     def set_captcha_context(
         self,
@@ -248,7 +350,7 @@ class reserve:
             for key, value in params
             if value
         )
-        referer = "https://office.chaoxing.com/front/third/apps/seat/code"
+        referer = self.code_url or self.api_urls[self.api_family]["code"]
         if query:
             referer = f"{referer}?{query}"
         logging.debug(f"Using captcha referer: {referer}")
@@ -516,80 +618,83 @@ class reserve:
 
         last_response_url = ""
 
-        while True:
-            attempt += 1
-            try:
-                if method.upper() == "POST":
-                    response = self._post(
-                        url=url,
-                        data=data or {},
-                        verify=False,
-                        request_name="seat page token fetch",
-                    )
-                else:
-                    response = self._get(
-                        url=url,
-                        verify=False,
-                        request_name="seat page token fetch",
-                    )
-            except requests.exceptions.RequestException as e:
-                logging.warning(f"Failed to fetch seat page token from {url}: {e}")
-                return "", ""
+        url_candidates = self._get_select_url_candidates(url)
 
-            final_url = getattr(response, "url", "")
-            last_response_url = final_url
-
-            # 统一按 UTF-8 解码，并忽略非法字符，避免 charset 识别错误导致正则匹配失败
-            html = response.content.decode("utf-8", errors="ignore")
-            last_html = html
-
-            # token 在隐藏 input 中，属性顺序和引号类型可能变化，这里做更宽松的匹配
-            # 例如：<input type="hidden" id="submit_enc" value="..."/>
-            # 注意：这里需要匹配 id/name 后面的等号和可选空格
-            token = self._extract_submit_enc(html)
-            if token:
-                # 现在页面没有单独的 algorithm 字段，直接复用 submit_enc
-                algorithm_value = token if require_value else ""
-                if attempt > 1:
-                    logging.info(
-                        f"Get page token from {url} succeeded on retry attempt {attempt}: {token}"
-                    )
-                return token, algorithm_value
-
-            not_open_yet = self._is_token_page_not_open(response_url=final_url)
-            page_msg = self._get_token_page_msg(final_url)
-            if not_open_retry_until is not None:
-                now = (
-                    datetime.datetime.now(not_open_retry_until.tzinfo)
-                    if getattr(not_open_retry_until, "tzinfo", None)
-                    else datetime.datetime.now()
-                )
-                if now < not_open_retry_until:
-                    remaining_s = max(
-                        0.0, (not_open_retry_until - now).total_seconds()
-                    )
-                    sleep_s = min(not_open_retry_interval, remaining_s)
-                    if not_open_yet:
-                        logging.warning(
-                            f"Get page token from {url} hit not-open-yet page on retry "
-                            f"{attempt}; keep refreshing for {remaining_s:.3f}s more "
-                            f"(sleep {sleep_s:.3f}s, msg={page_msg})"
+        for candidate_family, candidate_url in url_candidates:
+            attempt = 0
+            while True:
+                attempt += 1
+                try:
+                    if method.upper() == "POST":
+                        response = self._post(
+                            url=candidate_url,
+                            data=data or {},
+                            verify=False,
+                            request_name="seat page token fetch",
                         )
                     else:
-                        logging.warning(
-                            f"Get page token from {url} returned no submit_enc on retry "
-                            f"{attempt}; keep refreshing for {remaining_s:.3f}s more "
-                            f"(sleep {sleep_s:.3f}s)"
+                        response = self._get(
+                            url=candidate_url,
+                            verify=False,
+                            request_name="seat page token fetch",
                         )
-                    if sleep_s > 0:
-                        time.sleep(sleep_s)
-                    continue
-                logging.warning(
-                    f"Get page token from {url} stop refreshing after retry {attempt}: "
-                    f"reached retry deadline {not_open_retry_until}"
-                )
+                except requests.exceptions.RequestException as e:
+                    logging.warning(f"Failed to fetch seat page token from {candidate_url}: {e}")
+                    break
+
+                final_url = getattr(response, "url", "")
+                last_response_url = final_url
+
+                html = response.content.decode("utf-8", errors="ignore")
+                last_html = html
+
+                token = self._extract_submit_enc(html)
+                if token:
+                    algorithm_value = token if require_value else ""
+                    if candidate_family != self.api_family:
+                        logging.info(
+                            f"Get page token fallback switched API family to {candidate_family}"
+                        )
+                        self._set_api_family(candidate_family)
+                    if attempt > 1:
+                        logging.info(
+                            f"Get page token from {candidate_url} succeeded on retry attempt {attempt}: {token}"
+                        )
+                    return token, algorithm_value
+
+                not_open_yet = self._is_token_page_not_open(response_url=final_url)
+                page_msg = self._get_token_page_msg(final_url)
+                if not_open_retry_until is not None:
+                    now = (
+                        datetime.datetime.now(not_open_retry_until.tzinfo)
+                        if getattr(not_open_retry_until, "tzinfo", None)
+                        else datetime.datetime.now()
+                    )
+                    if now < not_open_retry_until:
+                        remaining_s = max(
+                            0.0, (not_open_retry_until - now).total_seconds()
+                        )
+                        sleep_s = min(not_open_retry_interval, remaining_s)
+                        if not_open_yet:
+                            logging.warning(
+                                f"Get page token from {candidate_url} hit not-open-yet page on retry "
+                                f"{attempt}; keep refreshing for {remaining_s:.3f}s more "
+                                f"(sleep {sleep_s:.3f}s, msg={page_msg})"
+                            )
+                        else:
+                            logging.warning(
+                                f"Get page token from {candidate_url} returned no submit_enc on retry "
+                                f"{attempt}; keep refreshing for {remaining_s:.3f}s more "
+                                f"(sleep {sleep_s:.3f}s)"
+                            )
+                        if sleep_s > 0:
+                            time.sleep(sleep_s)
+                        continue
+                    logging.warning(
+                        f"Get page token from {candidate_url} stop refreshing after retry {attempt}: "
+                        f"reached retry deadline {not_open_retry_until}"
+                    )
                 break
-            break
 
         # 取不到 token 时：
         # 1. 控制台打印部分页面内容
@@ -606,12 +711,12 @@ class reserve:
             debug_dir = os.path.join(os.path.dirname(__file__), "..", "html_debug")
             os.makedirs(debug_dir, exist_ok=True)
             ts = int(time.time() * 1000)
-            filename = os.path.join(debug_dir, f"seatengine_{ts}.html")
+            filename = os.path.join(debug_dir, f"{self.api_family}_{ts}.html")
             with open(filename, "w", encoding="utf-8") as f:
                 f.write(last_html)
-            logging.error(f"Full HTML of seatengine page saved to {filename}")
+            logging.error(f"Full HTML of seat page saved to {filename}")
         except Exception as e:
-            logging.warning(f"Failed to save debug HTML for seatengine page: {e}")
+            logging.warning(f"Failed to save debug HTML for seat page: {e}")
         return "", ""
 
     def warm_connection(self, url):
@@ -1318,22 +1423,8 @@ class reserve:
         logging.info(f"submit enc: {parm['enc']}")
 
         # 按前端行为采用表单提交（POST body），并关闭证书验证以避免告警
-        try:
-            response = self._post(
-                url=url,
-                data=parm,
-                verify=False,
-                request_name="seat submit",
-            )
-        except requests.exceptions.RequestException as e:
-            logging.warning(f"Seat submit request failed: {e}")
-            return False
-
-        html = response.content.decode("utf-8")
-        try:
-            data = json.loads(html)
-        except ValueError as e:
-            logging.error(f"Failed to parse seat submit response: {e}; body={html[:200]}")
+        data = self._submit_with_fallback(parm, request_name="seat submit")
+        if data is None:
             return False
         self.last_submit_result = data
         self.submit_msg.append(times[0] + "~" + times[1] + ":  " + str(data))
@@ -1370,23 +1461,9 @@ class reserve:
         }
         logging.info(f"[burst] submit parameter (before enc) {parm} ")
         parm["enc"] = verify_param(parm, value)
-        try:
-            response = self._post(
-                url=self.submit_url,
-                data=parm,
-                verify=False,
-                request_name="[burst] seat submit",
-            )
-        except requests.exceptions.RequestException as e:
-            logging.warning(f"[burst] Seat submit request failed: {e}")
-            return {"success": False, "msg": str(e)}
-
-        html = response.content.decode("utf-8")
-        try:
-            data = json.loads(html)
-        except ValueError as e:
-            logging.error(f"[burst] Failed to parse seat submit response: {e}; body={html[:200]}")
-            return {"success": False, "msg": "invalid submit response"}
+        data = self._submit_with_fallback(parm, request_name="[burst] seat submit")
+        if data is None:
+            return {"success": False, "msg": "submit request failed on all API families"}
         self.last_submit_result = data
         self.submit_msg.append(times[0] + "~" + times[1] + ":  " + str(data))
         logging.info(data)

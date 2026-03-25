@@ -82,7 +82,7 @@ def main():
 
     payload = _load_payload(args.payload_file)
     users = _iter_users(payload)
-    max_concurrency = args.concurrency or int(payload.get("server_max_concurrency") or 3)
+    max_concurrency = args.concurrency or int(payload.get("server_max_concurrency") or 13)
     max_concurrency = max(1, min(max_concurrency, len(users)))
 
     run_id = payload.get("run_id") or _beijing_now().strftime("%Y%m%d_%H%M%S_%f")

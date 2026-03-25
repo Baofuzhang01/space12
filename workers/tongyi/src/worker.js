@@ -419,6 +419,10 @@ function defaultSchool(id, name) {
     conflict_group: "",
     trigger_time: "19:57",
     endtime: "20:00:40",
+    seat_api_mode: "seat",
+    reserve_next_day: true,
+    enable_slider: false,
+    enable_textclick: false,
     fidEnc: "",
     reading_zone_groups: [],
     repo: `BAOfuZhan/${id}`,
@@ -427,7 +431,7 @@ function defaultSchool(id, name) {
     github_token: "",
     server_url: "",
     server_api_key: "",
-    server_max_concurrency: 3,
+    server_max_concurrency: 13,
     strategy: {
       mode: "C",
       submit_mode: "serial",
@@ -725,6 +729,10 @@ function buildDispatchPayloadForUser(school, user) {
   return {
     ...user,
     endtime: school.endtime,
+    seat_api_mode: school.seat_api_mode || "seat",
+    reserve_next_day: school.reserve_next_day !== false,
+    enable_slider: !!school.enable_slider,
+    enable_textclick: !!school.enable_textclick,
     strategy: randomizeStrategy(school.strategy),
   };
 }
@@ -772,7 +780,7 @@ async function dispatchUsersInBatches(env, school, users) {
   const serverApiKey = resolveServerApiKey(env, school);
   const serverMaxConcurrency = Math.max(
     1,
-    parseInt(school?.server_max_concurrency, 10) || 3,
+    parseInt(school?.server_max_concurrency, 10) || 13,
   );
   let okBatches = 0;
   const dispatchErrors = [];
@@ -1128,6 +1136,12 @@ async function handleAPI(request, env, path) {
       school.conflict_group = normalizeSecretText(body.conflict_group);
     }
     if (body.repo) school.repo = body.repo;
+    if (body.seat_api_mode !== undefined) {
+      school.seat_api_mode = normalizeSecretText(body.seat_api_mode).toLowerCase();
+    }
+    if (body.reserve_next_day !== undefined) school.reserve_next_day = !!body.reserve_next_day;
+    if (body.enable_slider !== undefined) school.enable_slider = !!body.enable_slider;
+    if (body.enable_textclick !== undefined) school.enable_textclick = !!body.enable_textclick;
     if (body.dispatch_target !== undefined) {
       school.dispatch_target = resolveDispatchTarget(body);
     }
@@ -1138,7 +1152,7 @@ async function handleAPI(request, env, path) {
     if (body.server_url !== undefined) school.server_url = normalizeSecretText(body.server_url);
     if (body.server_api_key !== undefined) school.server_api_key = normalizeSecretText(body.server_api_key);
     if (body.server_max_concurrency !== undefined) {
-      school.server_max_concurrency = Math.max(1, parseInt(body.server_max_concurrency, 10) || 3);
+      school.server_max_concurrency = Math.max(1, parseInt(body.server_max_concurrency, 10) || 13);
     }
     if (body.trigger_time) school.trigger_time = body.trigger_time;
     if (body.endtime) school.endtime = body.endtime;
@@ -1183,6 +1197,12 @@ async function handleAPI(request, env, path) {
     if (body.github_token_key !== undefined) {
       body.github_token_key = normalizeSecretText(body.github_token_key).toLowerCase();
     }
+    if (body.seat_api_mode !== undefined) {
+      body.seat_api_mode = normalizeSecretText(body.seat_api_mode).toLowerCase();
+    }
+    if (body.reserve_next_day !== undefined) body.reserve_next_day = !!body.reserve_next_day;
+    if (body.enable_slider !== undefined) body.enable_slider = !!body.enable_slider;
+    if (body.enable_textclick !== undefined) body.enable_textclick = !!body.enable_textclick;
     if (body.dispatch_target !== undefined) {
       body.dispatch_target = resolveDispatchTarget(body);
     }
@@ -1196,7 +1216,7 @@ async function handleAPI(request, env, path) {
       body.server_api_key = normalizeSecretText(body.server_api_key);
     }
     if (body.server_max_concurrency !== undefined) {
-      body.server_max_concurrency = Math.max(1, parseInt(body.server_max_concurrency, 10) || 3);
+      body.server_max_concurrency = Math.max(1, parseInt(body.server_max_concurrency, 10) || 13);
     }
     Object.assign(school, body, { id: school.id });
     await saveSchool(KV, school);
@@ -2140,6 +2160,25 @@ function renderAddSchoolModal() {
             <input type="text" id="new_school_repo" placeholder="BAOfuZhan/hcd">
           </div>
           <div class="form-group">
+            <label>选座接口模式</label>
+            <select id="new_school_seat_api_mode">
+              <option value="auto">auto - 优先 seatengine，失败自动回退</option>
+              <option value="seatengine">seatengine - 强制新版接口</option>
+              <option value="seat" selected>seat - 强制旧版接口</option>
+            </select>
+          </div>
+          <div class="form-row">
+            <div class="form-group">
+              <label><input type="checkbox" id="new_school_reserve_next_day" checked> 预约明天</label>
+            </div>
+            <div class="form-group">
+              <label><input type="checkbox" id="new_school_enable_slider"> 启用滑块验证码</label>
+            </div>
+          </div>
+          <div class="form-group">
+            <label><input type="checkbox" id="new_school_enable_textclick"> 启用选字验证码</label>
+          </div>
+          <div class="form-group">
             <label>分发目标</label>
             <select id="new_school_dispatch_target">
               <option value="github">github - 仅 GitHub Actions</option>
@@ -2169,7 +2208,7 @@ function renderAddSchoolModal() {
             </div>
             <div class="form-group">
               <label>服务器最大并发</label>
-              <input type="number" id="new_school_server_max_concurrency" value="3" min="1">
+              <input type="number" id="new_school_server_max_concurrency" value="13" min="1">
             </div>
           </div>
           <div class="form-group">
@@ -2226,11 +2265,14 @@ function renderSchoolDetail() {
           <div><strong>GitHub仓库:</strong> \${s.repo}</div>
           <div><strong>今日活跃用户:</strong> \${formatActiveTodayMeta(s.id)}</div>
           <div><strong>GitHub 密匙槽位:</strong> \${s.github_token_key ? s.github_token_key.toUpperCase() : "默认 GH_TOKEN"}</div>
+          <div><strong>选座接口:</strong> \${s.seat_api_mode || "seat"}</div>
+          <div><strong>预约日期:</strong> \${s.reserve_next_day === false ? "今天" : "明天"}</div>
           <div><strong>学校 fidEnc:</strong> \${s.fidEnc || "-"}</div>
           <div><strong>冲突分组:</strong> \${s.conflict_group || (s.fidEnc ? "自动按 fidEnc" : (s.name || "-"))}</div>
+          <div><strong>验证码:</strong> \${s.enable_slider ? "滑块" : (s.enable_textclick ? "选字" : "关闭")}</div>
           <div><strong>分发目标:</strong> \${s.dispatch_target || "github"}</div>
           <div><strong>服务器地址:</strong> \${s.server_url || "-"}</div>
-          <div><strong>服务器并发:</strong> \${s.server_max_concurrency || 3}</div>
+          <div><strong>服务器并发:</strong> \${s.server_max_concurrency || 13}</div>
           <div><strong>服务器密钥:</strong> \${s.has_server_api_key ? "已配置" : "未配置/使用环境变量"}</div>
         </div>
       </div>
@@ -2356,6 +2398,25 @@ function renderEditSchoolModal() {
             </select>
           </div>
           <div class="form-group">
+            <label>选座接口模式</label>
+            <select id="edit_school_seat_api_mode">
+              <option value="auto" \${s.seat_api_mode==="auto" ? "selected" : ""}>auto - 优先 seatengine，失败自动回退</option>
+              <option value="seatengine" \${s.seat_api_mode==="seatengine" ? "selected" : ""}>seatengine - 强制新版接口</option>
+              <option value="seat" \${(!s.seat_api_mode || s.seat_api_mode==="seat") ? "selected" : ""}>seat - 强制旧版接口</option>
+            </select>
+          </div>
+          <div class="form-row">
+            <div class="form-group">
+              <label><input type="checkbox" id="edit_school_reserve_next_day" \${s.reserve_next_day === false ? "" : "checked"}> 预约明天</label>
+            </div>
+            <div class="form-group">
+              <label><input type="checkbox" id="edit_school_enable_slider" \${s.enable_slider ? "checked" : ""}> 启用滑块验证码</label>
+            </div>
+          </div>
+          <div class="form-group">
+            <label><input type="checkbox" id="edit_school_enable_textclick" \${s.enable_textclick ? "checked" : ""}> 启用选字验证码</label>
+          </div>
+          <div class="form-group">
             <label>GitHub 密匙槽位</label>
             <select id="edit_school_github_token_key">
               <option value="" \${!s.github_token_key ? "selected" : ""}>默认 GH_TOKEN</option>
@@ -2373,7 +2434,7 @@ function renderEditSchoolModal() {
             </div>
             <div class="form-group">
               <label>服务器最大并发</label>
-              <input type="number" id="edit_school_server_max_concurrency" value="\${s.server_max_concurrency || 3}" min="1">
+              <input type="number" id="edit_school_server_max_concurrency" value="\${s.server_max_concurrency || 13}" min="1">
             </div>
           </div>
           <div class="form-group">
@@ -2606,12 +2667,16 @@ async function doAddSchool() {
   const id = document.getElementById("new_school_id").value.trim();
   const name = document.getElementById("new_school_name").value.trim();
   const repo = document.getElementById("new_school_repo").value.trim();
+  const seat_api_mode = document.getElementById("new_school_seat_api_mode").value.trim().toLowerCase();
+  const reserve_next_day = document.getElementById("new_school_reserve_next_day").checked;
+  const enable_slider = document.getElementById("new_school_enable_slider").checked;
+  const enable_textclick = document.getElementById("new_school_enable_textclick").checked;
   const dispatch_target = document.getElementById("new_school_dispatch_target").value.trim().toLowerCase();
   const conflict_group = document.getElementById("new_school_conflict_group").value.trim();
   const github_token_key = document.getElementById("new_school_github_token_key").value.trim().toLowerCase();
   const server_url = document.getElementById("new_school_server_url").value.trim();
   const server_api_key = document.getElementById("new_school_server_api_key").value.trim();
-  const server_max_concurrency = parseInt(document.getElementById("new_school_server_max_concurrency").value, 10) || 3;
+  const server_max_concurrency = parseInt(document.getElementById("new_school_server_max_concurrency").value, 10) || 13;
   const trigger_time = document.getElementById("new_school_trigger").value.trim();
   const endtime = document.getElementById("new_school_endtime").value.trim();
   const fidEnc = document.getElementById("new_school_fidEnc").value.trim();
@@ -2620,6 +2685,10 @@ async function doAddSchool() {
     id,
     name,
     repo,
+    seat_api_mode,
+    reserve_next_day,
+    enable_slider,
+    enable_textclick,
     dispatch_target,
     conflict_group,
     github_token_key,
@@ -2684,10 +2753,14 @@ function showEditSchool() {
 async function doEditSchool() {
   const s = currentSchool;
   const githubTokenKey = document.getElementById("edit_school_github_token_key").value.trim().toLowerCase();
+  const seatApiMode = document.getElementById("edit_school_seat_api_mode").value.trim().toLowerCase();
+  const reserveNextDay = document.getElementById("edit_school_reserve_next_day").checked;
+  const enableSlider = document.getElementById("edit_school_enable_slider").checked;
+  const enableTextclick = document.getElementById("edit_school_enable_textclick").checked;
   const dispatchTarget = document.getElementById("edit_school_dispatch_target").value.trim().toLowerCase();
   const serverUrl = document.getElementById("edit_school_server_url").value.trim();
   const serverApiKeyInput = document.getElementById("edit_school_server_api_key").value.trim();
-  const serverMaxConcurrency = parseInt(document.getElementById("edit_school_server_max_concurrency").value, 10) || 3;
+  const serverMaxConcurrency = parseInt(document.getElementById("edit_school_server_max_concurrency").value, 10) || 13;
   const burstOffsetsText = document.getElementById("edit_strategy_burst").value;
   const burstOffsets = burstOffsetsText
     .split(",")
@@ -2719,6 +2792,10 @@ async function doEditSchool() {
   const body = {
     name: document.getElementById("edit_school_name").value.trim(),
     repo: document.getElementById("edit_school_repo").value.trim(),
+    seat_api_mode: seatApiMode,
+    reserve_next_day: reserveNextDay,
+    enable_slider: enableSlider,
+    enable_textclick: enableTextclick,
     dispatch_target: dispatchTarget,
     conflict_group: document.getElementById("edit_school_conflict_group").value.trim(),
     github_token_key: githubTokenKey,
