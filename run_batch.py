@@ -7,6 +7,8 @@ import pathlib
 import re
 import subprocess
 import sys
+import urllib.error
+import urllib.request
 
 
 DEFAULT_SERVER_PROJECT_ROOT = "/opt/Main_ChaoXingReserveSeat"
@@ -14,6 +16,13 @@ ROOT_DIR = pathlib.Path(
     os.getenv("SERVER_PROJECT_ROOT", DEFAULT_SERVER_PROJECT_ROOT)
 ).resolve()
 RUNS_DIR = ROOT_DIR / "server_runs"
+KEY_LOG_PATTERN = re.compile(
+    r"Start first attempt|login successfully|\[strategic\]|\[burst\]|\[warm\]|"
+    r"submit parameter|submit enc|Get token|Got token|token fetch failed|No submit_enc|"
+    r"captcha|Slider captcha token|Textclick captcha token|保存失败|seat-increment|"
+    r"dispatch|HTTP [0-9]{3}|exception|error|Current time|reserved successfully|success list",
+    re.IGNORECASE,
+)
 
 
 def _beijing_now() -> datetime.datetime:
@@ -51,6 +60,92 @@ def _build_user_dispatch_payload(payload: dict, user: dict) -> dict:
         if key not in merged and key in payload:
             merged[key] = payload.get(key)
     return merged
+
+
+def _get_feishu_webhook() -> str:
+    for env_name in [
+        "SERVER_FEISHU_WEBHOOK",
+        "FEISHU_WEBHOOK",
+        "FEISHU_BOT_WEBHOOK",
+    ]:
+        value = str(os.getenv(env_name, "")).strip()
+        if value:
+            return value
+    return ""
+
+
+def _get_feishu_keyword() -> str:
+    return str(os.getenv("SERVER_FEISHU_KEYWORD", "腾讯云")).strip() or "腾讯云"
+
+
+def _extract_key_log_lines(log_path: pathlib.Path, limit: int = 80) -> list[str]:
+    try:
+        with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
+            lines = [line.rstrip() for line in f if KEY_LOG_PATTERN.search(line)]
+    except OSError:
+        return []
+    return lines[-limit:]
+
+
+def _send_feishu_text(text: str) -> dict:
+    webhook = _get_feishu_webhook()
+    if not webhook:
+        return {"ok": False, "skipped": True, "reason": "webhook_missing"}
+    keyword = _get_feishu_keyword()
+    normalized_text = str(text or "")
+    if keyword not in normalized_text:
+        normalized_text = f"{keyword}\n{normalized_text}"
+
+    body = json.dumps(
+        {"msg_type": "text", "content": {"text": normalized_text}},
+        ensure_ascii=False,
+    ).encode("utf-8")
+    req = urllib.request.Request(
+        webhook,
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            detail = resp.read().decode("utf-8", errors="ignore")
+            return {
+                "ok": 200 <= getattr(resp, "status", 0) < 300,
+                "status": getattr(resp, "status", 0),
+                "detail": detail[:300],
+            }
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", errors="ignore")
+        return {"ok": False, "status": e.code, "detail": detail[:300]}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def _notify_feishu_for_user(result: dict, run_id: str):
+    log_path = pathlib.Path(result["log_path"])
+    key_lines = _extract_key_log_lines(log_path)
+    log_excerpt = "\n".join(key_lines) if key_lines else "[no key log lines matched]"
+    text = (
+        "【服务器抢座日志】\n"
+        f"run_id: {run_id}\n"
+        f"user: {result.get('display_name') or result.get('username') or 'user'}\n"
+        f"returncode: {result.get('returncode')}\n"
+        f"log_path: {result.get('log_path')}\n\n"
+        f"{log_excerpt}"
+    )
+    notify_result = _send_feishu_text(text[:3500])
+    print(
+        json.dumps(
+            {
+                "event": "feishu_notify_user",
+                "run_id": run_id,
+                "username": result.get("username"),
+                "display_name": result.get("display_name"),
+                "notify_result": notify_result,
+            },
+            ensure_ascii=False,
+        )
+    )
 
 
 def _run_one(user: dict, index: int, run_dir: pathlib.Path, payload: dict) -> dict:
@@ -139,7 +234,9 @@ def main():
             for idx, user in enumerate(users)
         ]
         for future in concurrent.futures.as_completed(futures):
-            summary["results"].append(future.result())
+            result = future.result()
+            summary["results"].append(result)
+            _notify_feishu_for_user(result, run_id)
 
     summary["results"].sort(key=lambda item: item["index"])
     summary["finished_at"] = _beijing_now().isoformat()
