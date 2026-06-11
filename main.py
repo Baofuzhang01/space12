@@ -97,37 +97,41 @@ def _try_page_prewarm_with_full_window(
     request_nodes,
     *,
     not_before: datetime.datetime | None = None,
+    minimum_window_s: float = 4.0,
 ) -> bool:
     """Run one 4-second page pre-warm only when the next pending request node is far enough."""
     now = _beijing_now()
+    minimum_window_s = max(4.0, float(minimum_window_s))
     if not request_nodes:
         logging.info("[warm] Skip connection pre-warm because no pending request node was provided")
-        return True
+        return False
 
     nearest_node_name, nearest_node_dt = min(request_nodes, key=lambda item: item[1])
     planned_start_dt = max(now, not_before) if not_before is not None else now
     warm_budget_s = (nearest_node_dt - planned_start_dt).total_seconds()
-    if warm_budget_s < 4.0:
+    if warm_budget_s <= minimum_window_s:
         logging.info(
             "[warm] Skip connection pre-warm because its planned start leaves only %.0fms "
-            "before %s request node; a full 4000ms warm window is required",
+            "before %s request node; more than %.0fms is required",
             warm_budget_s * 1000,
             nearest_node_name,
+            minimum_window_s * 1000,
         )
-        return True
+        return False
 
     if not_before is not None:
         _wait_until(not_before)
 
     remaining_s = (nearest_node_dt - _beijing_now()).total_seconds()
-    if remaining_s < 4.0:
+    if remaining_s <= minimum_window_s:
         logging.info(
             "[warm] Skip connection pre-warm after waiting because only %.0fms remain before "
-            "%s request node; a full 4000ms warm window is required",
+            "%s request node; more than %.0fms is required",
             remaining_s * 1000,
             nearest_node_name,
+            minimum_window_s * 1000,
         )
-        return True
+        return False
 
     logging.info(
         "[warm] Dispatch connection pre-warm with full 4000ms window before "
@@ -1754,18 +1758,33 @@ def strategic_first_attempt(
 
         # 连接预热：只有首个配置执行一次，后续配置直接复用已预热的连接池
         if is_primary_strategy_config and not warm_done:
-            warm_dt = target_dt - datetime.timedelta(
-                milliseconds=WARM_CONNECTION_LEAD_MS
-            )
-            # 后置页面预热只会在验证码流程结束后执行；此时仅判断距离首个
-            # 轻探测/正式 token 请求是否还具备完整 4 秒窗口。
             first_token_start_dt = _get_first_token_start_dt(target_dt)
-            warm_done = _try_page_prewarm_with_full_window(
-                s,
-                _warm_url,
-                [("probe/token", first_token_start_dt)],
-                not_before=warm_dt,
+            captcha_enabled = bool(ENABLE_ROTATE or ENABLE_SLIDER or ENABLE_TEXTCLICK)
+            allow_early_warm_after_captcha = (
+                captcha_enabled and WARM_CONNECTION_LEAD_MS > 4500
             )
+            if allow_early_warm_after_captcha:
+                # 后置页面预热只会在验证码流程结束后执行；此时仅判断距离首个
+                # 轻探测/正式 token 请求是否大于 4400ms。满足时立即预热，
+                # 不再等待配置的页面预热时刻。只有配置早于 T-4500ms 才启用。
+                warm_done = _try_page_prewarm_with_full_window(
+                    s,
+                    _warm_url,
+                    [("probe/token", first_token_start_dt)],
+                    minimum_window_s=4.4,
+                )
+            if not warm_done:
+                # 提前预热未执行、未启用验证码，或配置不早于 T-4500ms 时，
+                # 到配置时刻再进行一次标准 4 秒窗口判断。
+                warm_dt = target_dt - datetime.timedelta(
+                    milliseconds=WARM_CONNECTION_LEAD_MS
+                )
+                warm_done = _try_page_prewarm_with_full_window(
+                    s,
+                    _warm_url,
+                    [("probe/token", first_token_start_dt)],
+                    not_before=warm_dt,
+                )
 
         skip_first_strategic_submit = not _ensure_textclick_captcha1_before_strategic_token()
         use_serial_followups = skip_first_strategic_submit and SUBMIT_MODE == "burst"
