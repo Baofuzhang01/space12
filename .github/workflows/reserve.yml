@@ -89,6 +89,7 @@ jobs:
         env:
           CX_USERNAME: ${{ secrets.CX_USERNAME }}
           CX_PASSWORD: ${{ secrets.CX_PASSWORD }}
+          PASSWORD_DECRYPTION_PRIVATE_KEY_B64: ${{ secrets.PASSWORD_DECRYPTION_PRIVATE_KEY_B64 }}
           DISPATCH_PAYLOAD: ${{ toJson(matrix.user) }}
           CHAOJIYING_USERNAME: ${{ secrets.CHAOJIYING_USERNAME }}
           CHAOJIYING_PASSWORD: ${{ secrets.CHAOJIYING_PASSWORD }}
